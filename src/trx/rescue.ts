@@ -732,3 +732,261 @@ export async function runTrxRelay(options: TrxRelayOptions): Promise<void> {
   }
 }
 
+export interface TrxWatchOptions {
+  recipient?: string;
+  minTrx?: number; // trigger when victim balance >= minTrx (default 0.5 TRX)
+  pollIntervalMs?: number; // default 250ms (4 req/s, safe with TronGrid API key)
+  stopAfterFirst?: boolean; // default false (keep watching)
+  dryRun?: boolean;
+}
+
+async function fetchNowBlockTaPoS(
+  host: string,
+  apiKey?: string
+): Promise<{ refBlockBytes: string; refBlockHash: string; blockNumber: number; timestamp: number }> {
+  const url = `${host.replace(/\/$/, '')}/wallet/getnowblock`;
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (apiKey && host.includes('trongrid')) {
+    headers['TRON-PRO-API-KEY'] = apiKey;
+  }
+  const res = await fetch(url, { method: 'POST', headers, body: '{}' });
+  const blk: any = await res.json();
+  const blockId: string = blk?.blockID;
+  const blockNumber: number = Number(blk?.block_header?.raw_data?.number ?? 0);
+  if (!blockId || blockId.length < 32 || !blockNumber) {
+    throw new Error(`Gagal membaca block terbaru dari ${host}`);
+  }
+  const refBlockBytes = (blockNumber & 0xffff).toString(16).padStart(4, '0');
+  const refBlockHash = blockId.slice(16, 32);
+  return {
+    refBlockBytes,
+    refBlockHash,
+    blockNumber,
+    timestamp: Date.now(),
+  };
+}
+
+async function fetchAccountBalanceFast(
+  host: string,
+  addressHex: string,
+  apiKey?: string
+): Promise<number> {
+  const url = `${host.replace(/\/$/, '')}/wallet/getaccount`;
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (apiKey && host.includes('trongrid')) {
+    headers['TRON-PRO-API-KEY'] = apiKey;
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 2500);
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ address: addressHex, visible: false }),
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+    if (!res.ok) return -1;
+    const json: any = await res.json();
+    return Number(json?.balance ?? 0);
+  } catch {
+    clearTimeout(timer);
+    return -1;
+  }
+}
+
+export async function runTrxWatcher(options: TrxWatchOptions): Promise<void> {
+  log.title('TRON MAINNET - HIGH-SPEED AUTO-FORWARD TRX WATCHER');
+
+  const victimKey = requireEnv('TRX_VICTIM_PRIVATE_KEY').replace(/^0x/, '').trim();
+  const recipient = (options.recipient || requireEnv('TRX_SAFE_RECIPIENT')).trim();
+  const primaryHost = optionalEnv('TRX_FULL_HOST', 'https://api.trongrid.io');
+  const apiKey = optionalEnv('TRX_TRONGRID_API_KEY');
+  const broadcastNodes = Array.from(
+    new Set([primaryHost, ...parseCsvEnv('TRX_EXTRA_BROADCAST_NODES', [])])
+  );
+
+  if (!apiKey && primaryHost.includes('trongrid')) {
+    log.warn('TRX_TRONGRID_API_KEY kosong! Sangat disarankan pasang API key gratis TronGrid agar polling cepat tidak kena HTTP 429.');
+  }
+
+  const victimTron = createTronWeb(victimKey);
+  const victimAddr = victimTron.defaultAddress.base58 as string;
+  const victimHex = victimTron.address.toHex(victimAddr);
+
+  if (!victimTron.isAddress(recipient)) {
+    throw new Error(`Alamat safe recipient Tron tidak valid: ${recipient}`);
+  }
+  if (recipient.toLowerCase() === victimAddr.toLowerCase()) {
+    throw new Error('Safe recipient tidak boleh sama dengan wallet korban!');
+  }
+
+  // 1. Audit victim permissions + check recipient activation + initial bandwidth
+  const [victimAcc, victimRes, recipientAcc] = await Promise.all([
+    victimTron.trx.getAccount(victimAddr),
+    victimTron.trx.getAccountResources(victimAddr),
+    victimTron.trx.getAccount(recipient),
+  ]);
+
+  const audit = auditTronPermissions(victimTron, victimAcc, victimAddr);
+  if (audit.isCompromisedMultiSig) {
+    log.err('BATAL OTOMATIS: Wallet korban terkena MULTI-SIG TAKEOVER!');
+    for (const r of audit.reasons) console.log(`  -> ${r}`);
+    throw new Error('Tidak bisa menjalankan watcher pada wallet Multi-Sig Takeover.');
+  }
+
+  const recipientActivated = Boolean(recipientAcc && recipientAcc.address);
+  let cachedAvailBw =
+    Number(victimRes?.freeNetLimit ?? 0) -
+    Number(victimRes?.freeNetUsed ?? 0) +
+    (Number(victimRes?.NetLimit ?? 0) - Number(victimRes?.NetUsed ?? 0));
+
+  const minTrx = options.minTrx ?? 0.5;
+  const minSun = Math.round(minTrx * 1e6);
+  const pollMs = Math.max(100, options.pollIntervalMs ?? 250);
+
+  console.log(`Victim Dipantau   : ${victimAddr}`);
+  console.log(`Safe Wallet Tujuan: ${recipient} (${recipientActivated ? 'SUDAH AKTIF' : 'BELUM AKTIF! +1.1 TRX fee'})`);
+  console.log(`Trigger Minimal   : >= ${minTrx} TRX`);
+  console.log(`Bandwidth Awal    : ${cachedAvailBw}`);
+  console.log(`Interval Polling  : ${pollMs}ms | Nodes: ${broadcastNodes.join(', ')}`);
+  console.log(`Mode              : ${options.dryRun ? 'DRY-RUN (tidak kirim tx)' : 'LIVE AUTO-FORWARD'}`);
+
+  if (!recipientActivated) {
+    log.warn('PERINGATAN: Wallet tujuan belum aktif! Aktifkan dulu (kirim 0.1 TRX dari wallet lain) agar transfer rescue memakan 0 TRX biaya aktivasi.');
+  }
+
+  // 2. Keep latest TaPoS ref_block_bytes & ref_block_hash hot in memory (refreshed every 1.5s)
+  let cachedTapos = await fetchNowBlockTaPoS(primaryHost, apiKey);
+  log.ok(
+    `TaPoS cache siap (Block #${cachedTapos.blockNumber}, ref=${cachedTapos.refBlockBytes}/${cachedTapos.refBlockHash}). Tekan Ctrl+C untuk berhenti.\n`
+  );
+
+  let running = true;
+  const onSigInt = () => {
+    running = false;
+    console.log('\n');
+    log.info('Watcher dihentikan oleh user.');
+  };
+  process.once('SIGINT', onSigInt);
+
+  const taposTimer = setInterval(async () => {
+    if (!running) return;
+    try {
+      cachedTapos = await fetchNowBlockTaPoS(primaryHost, apiKey);
+    } catch {
+      // keep previous TaPoS (valid for ~60s)
+    }
+  }, 1500);
+
+  const bwTimer = setInterval(async () => {
+    if (!running) return;
+    try {
+      const r = await victimTron.trx.getAccountResources(victimAddr);
+      cachedAvailBw =
+        Number(r?.freeNetLimit ?? 0) -
+        Number(r?.freeNetUsed ?? 0) +
+        (Number(r?.NetLimit ?? 0) - Number(r?.NetUsed ?? 0));
+    } catch {
+      // ignore transient error
+    }
+  }, 6000);
+
+  let polls = 0;
+  let lastLoggedBal = -1;
+
+  try {
+    while (running) {
+      const balSun = await fetchAccountBalanceFast(primaryHost, victimHex, apiKey);
+      polls++;
+
+      if (balSun >= 0) {
+        if (balSun !== lastLoggedBal) {
+          lastLoggedBal = balSun;
+          process.stdout.write(
+            `\r[Poll #${polls}] Block #${cachedTapos.blockNumber} | Saldo Victim: ${(balSun / 1e6).toFixed(6)} TRX | BW: ${cachedAvailBw}   `
+          );
+        } else if (polls % 20 === 0) {
+          process.stdout.write(
+            `\r[Poll #${polls}] Block #${cachedTapos.blockNumber} | Saldo Victim: ${(balSun / 1e6).toFixed(6)} TRX | BW: ${cachedAvailBw}   `
+          );
+        }
+
+        if (balSun >= minSun) {
+          const detectTime = Date.now();
+          console.log('\n');
+          log.warn(`SALDO TERDETEKSI: ${(balSun / 1e6).toFixed(6)} TRX! Menyiapkan offline-signed sweep...`);
+
+          const activationReserve = recipientActivated ? 0 : 1_100_000;
+          const bwReserve = cachedAvailBw >= 280 ? 0 : 300_000;
+          const sendSun = balSun - activationReserve - bwReserve;
+
+          if (sendSun <= 0) {
+            log.warn(
+              `Saldo (${(balSun / 1e6).toFixed(6)} TRX) tidak cukup setelah cadangan fee (${((activationReserve + bwReserve) / 1e6).toFixed(2)} TRX).`
+            );
+          } else {
+            const now = Date.now();
+            const signedTx = await buildOfflineSignedTrxTransfer({
+              tronWeb: victimTron,
+              fromPrivateKey: victimKey,
+              fromBase58: victimAddr,
+              toBase58: recipient,
+              amountSun: sendSun,
+              refBlockBytes: cachedTapos.refBlockBytes,
+              refBlockHash: cachedTapos.refBlockHash,
+              timestamp: now,
+              expiration: now + 60_000,
+            });
+            const signElapsed = Date.now() - detectTime;
+
+            if (options.dryRun) {
+              log.ok(
+                `[DRY-RUN] Offline sign selesai dalam ${signElapsed}ms! Akan mengirim ${(sendSun / 1e6).toFixed(6)} TRX -> ${recipient} (txID: ${signedTx.txID})`
+              );
+              if (options.stopAfterFirst) break;
+              await sleep(3000);
+            } else {
+              const body = JSON.stringify(signedTx);
+              // Fire immediately + 2 fast retries (50ms, 120ms) if rejected/transient
+              let accepted = false;
+              for (const retryDelay of [0, 50, 120]) {
+                if (retryDelay > 0) await sleep(retryDelay);
+                const resList = await Promise.all(
+                  broadcastNodes.map((h) => broadcastRawBodyToNode(h, body, apiKey))
+                );
+                const hit = resList.find((r) => r.ok || r.code === 'DUP_TRANSACTION_ERROR');
+                if (hit) {
+                  accepted = true;
+                  log.ok(
+                    `TERKIRIM dalam ${Date.now() - detectTime}ms (sign=${signElapsed}ms)! ${(sendSun / 1e6).toFixed(6)} TRX -> ${recipient}`
+                  );
+                  console.log(`  TronScan: https://tronscan.org/#/transaction/${signedTx.txID}`);
+                  break;
+                } else {
+                  const errMsg = resList.map((r) => r.message || r.code).join(' | ');
+                  log.warn(`Percobaan broadcast ditolak (${errMsg})`);
+                }
+              }
+
+              // Refresh bandwidth & wait 1 block (~3.2s) so we don't double-fire on stale balance
+              cachedAvailBw = Math.max(0, cachedAvailBw - 270);
+              if (accepted && options.stopAfterFirst) {
+                break;
+              }
+              await sleep(3200);
+              lastLoggedBal = -1;
+            }
+          }
+        }
+      }
+
+      await sleep(pollMs);
+    }
+  } finally {
+    clearInterval(taposTimer);
+    clearInterval(bwTimer);
+    process.removeListener('SIGINT', onSigInt);
+  }
+}
+

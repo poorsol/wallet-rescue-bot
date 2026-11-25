@@ -1,6 +1,6 @@
 import { checkEthWallet, runEthRescue, type EthRescueMode } from './eth/rescue.js';
 import { checkSolWallet, runSolRescue } from './sol/rescue.js';
-import { checkTrxWallet, runTrxRelay, runTrxRescue } from './trx/rescue.js';
+import { checkTrxWallet, runTrxRelay, runTrxRescue, runTrxWatcher } from './trx/rescue.js';
 import { log } from './utils/config.js';
 
 function parseArgs(argv: string[]): { positional: string[]; flags: Record<string, string | boolean> } {
@@ -53,6 +53,7 @@ TRON:
   npm run trx:check T... [--token TR7NHq...]
   npm run trx:rescue -- [--token TR7NHq...] [--amount max] [--delegate-energy 3000] [--dry-run]
   npm run trx:relay -- --amount 4 [--recipient T...] [--activate-first] [--dry-run]
+  npm run trx:watch -- --recipient T... [--min 0.5] [--interval 250] [--once] [--dry-run]
 `);
 }
 
@@ -138,6 +139,17 @@ async function main() {
       activateRecipientFirst: boolFlag(flags, 'activate-first'),
       burstIntervalMs: Number(strFlag(flags, 'interval') ?? '150'),
       burstDurationMs: Number(strFlag(flags, 'duration') ?? '9000'),
+      dryRun: boolFlag(flags, 'dry-run'),
+    });
+    return;
+  }
+
+  if (chain === 'trx' && action === 'watch') {
+    await runTrxWatcher({
+      recipient: strFlag(flags, 'recipient'),
+      minTrx: Number(strFlag(flags, 'min') ?? '0.5'),
+      pollIntervalMs: Number(strFlag(flags, 'interval') ?? '250'),
+      stopAfterFirst: boolFlag(flags, 'once'),
       dryRun: boolFlag(flags, 'dry-run'),
     });
     return;

@@ -80,6 +80,9 @@ npm run trx:rescue -- --amount max --delegate-energy 3000 --dry-run
 
 # TRX: Kirim TRX dari wallet korban ke alamat wajib via Offline Pre-Sign & Rapid-Fire Relay
 npm run trx:relay -- --amount 4 --recipient TEK6BJ1BevocAx8TQd2p1cc7gamWqk9KWA --dry-run
+
+# TRX: Standby Auto-Forward Watcher (otomatis teruskan TRX masuk ke wallet aman pribadi)
+npm run trx:watch -- --recipient <WALLET_AMAN_PRIBADI> --min 0.5
 ```
 *(Hapus `--dry-run` jika hasil simulasi sudah sukses dan kamu siap mengirim transaksi live.)*
 

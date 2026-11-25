@@ -2,7 +2,7 @@ import { createInterface } from 'node:readline/promises';
 import { stdin as input, stdout as output } from 'node:process';
 import { checkEthWallet, runEthRescue, type EthRescueMode } from './eth/rescue.js';
 import { checkSolWallet, runSolRescue } from './sol/rescue.js';
-import { checkTrxWallet, runTrxRelay, runTrxRescue } from './trx/rescue.js';
+import { checkTrxWallet, runTrxRelay, runTrxRescue, runTrxWatcher } from './trx/rescue.js';
 import { COLORS, log } from './utils/config.js';
 
 const rl = createInterface({ input, output });
@@ -169,6 +169,24 @@ async function menuTrxRelay() {
   }
 }
 
+async function menuTrxWatch() {
+  const recipient = await ask(
+    'Alamat WALLET AMAN PRIBADI tujuan auto-forward (WAJIB cek jgn sampai masih alamat tujuan lama!)'
+  );
+  const minTrx = Number(await ask('Minimal saldo TRX untuk langsung diteruskan (mis. 0.5 atau 1)', '0.5'));
+  const pollIntervalMs = Number(await ask('Interval cek dalam ms (rekomendasi: 250)', '250'));
+  const stopAfterFirst = await askYesNo('Otomatis berhenti setelah 1x kiriman berhasil diteruskan?', false);
+  const dryRun = await askYesNo('Mode DRY-RUN (pantau saja tanpa kirim live)?', false);
+
+  await runTrxWatcher({
+    recipient: recipient || undefined,
+    minTrx,
+    pollIntervalMs,
+    stopAfterFirst,
+    dryRun,
+  });
+}
+
 async function main() {
   console.log(`${COLORS.bold}${COLORS.cyan}`);
   console.log('======================================================');
@@ -185,9 +203,10 @@ async function main() {
     console.log('  5. [TRX] Cek Status Wallet & Deteksi Multi-Sig Takeover');
     console.log('  6. [TRX] Jalankan Resource-Delegated TRC-20 Rescue (USDT)');
     console.log('  7. [TRX] Kirim TRX via Offline Pre-Sign & Rapid-Fire Relay');
+    console.log('  8. [TRX] Standby Auto-Forward Watcher (Otomatis teruskan TRX masuk ke wallet aman)');
     console.log('  0. Keluar');
 
-    const pick = await ask('\nPilih menu (0-7)');
+    const pick = await ask('\nPilih menu (0-8)');
     try {
       if (pick === '0') {
         break;
@@ -210,6 +229,8 @@ async function main() {
         await menuTrxRescue();
       } else if (pick === '7') {
         await menuTrxRelay();
+      } else if (pick === '8') {
+        await menuTrxWatch();
       } else {
         log.warn('Menu tidak dikenali.');
       }

@@ -558,11 +558,17 @@ export async function runTrxRelay(options: TrxRelayOptions): Promise<void> {
 
   const sendSun = Math.round(options.amountTrx * 1e6);
 
-  // If recipient is not activated on-chain, Tron burns 1.1 TRX (1 TRX create fee + 0.1 TRX bw)
-  // unless sponsor activates it first via AccountCreateContract.
+  // If recipient is not activated on-chain, Tron burns 1.0 TRX account creation fee + ~0.27 TRX bandwidth
+  // (cannot rely on Free Bandwidth for account creation; 1.3 TRX covers both safely).
+  // Even better: pass --activate-first so Sponsor activates recipient cleanly first!
   const willActivateFirst = !recipientActivated && Boolean(options.activateRecipientFirst);
-  const activationExtraSun = !recipientActivated && !willActivateFirst ? 1_100_000 : 0;
-  const bwExtraSun = availBw < 280 && activationExtraSun === 0 ? 280_000 : 0;
+  const activationExtraSun = !recipientActivated && !willActivateFirst ? 1_000_000 : 0;
+  const bwExtraSun =
+    !recipientActivated && !willActivateFirst
+      ? 300_000
+      : availBw < 280
+        ? 280_000
+        : 0;
   const totalVictimNeededSun = sendSun + activationExtraSun + bwExtraSun;
   const sponsorFundSun = Math.max(0, totalVictimNeededSun - victimBalSun);
 
@@ -728,13 +734,27 @@ export async function runTrxRelay(options: TrxRelayOptions): Promise<void> {
     );
   }
 
-  // 4. Verify on-chain receipt after ~6s
+  // 4. Verify on-chain receipt after ~6s (query PublicNode / primaryHost via fetch to avoid TronGrid 429)
   log.info('Menunggu 6 detik untuk verifikasi hasil on-chain di TronScan...');
   await sleep(6000);
 
+  const checkHost = broadcastNodes[0];
+  const fetchTxInfo = async (txid: string) => {
+    try {
+      const res = await fetch(`${checkHost.replace(/\/$/, '')}/wallet/gettransactioninfobyid`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ value: txid }),
+      });
+      return (await res.json()) as any;
+    } catch {
+      return null;
+    }
+  };
+
   const [info1, info2] = await Promise.all([
-    sponsorTron.trx.getTransactionInfo(tx1Signed.txID),
-    victimTron.trx.getTransactionInfo(tx2Signed.txID),
+    fetchTxInfo(tx1Signed.txID),
+    fetchTxInfo(tx2Signed.txID),
   ]);
 
   console.log('\n--- HASIL ON-CHAIN ---');

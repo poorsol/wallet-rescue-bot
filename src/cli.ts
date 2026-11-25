@@ -26,11 +26,17 @@ function parseArgs(argv: string[]): { positional: string[]; flags: Record<string
 
 function strFlag(flags: Record<string, string | boolean>, key: string): string | undefined {
   const v = flags[key];
-  return typeof v === 'string' ? v : undefined;
+  if (typeof v === 'string') return v;
+  // Fallback for Windows PowerShell where npm absorbs --flag into npm_config_* env vars
+  const envKey = `npm_config_${key.replace(/-/g, '_')}`;
+  const envVal = process.env[envKey];
+  return envVal && envVal !== 'true' ? envVal : undefined;
 }
 
 function boolFlag(flags: Record<string, string | boolean>, key: string): boolean {
-  return flags[key] === true || flags[key] === 'true';
+  if (flags[key] === true || flags[key] === 'true') return true;
+  const envKey = `npm_config_${key.replace(/-/g, '_')}`;
+  return process.env[envKey] === 'true';
 }
 
 function printHelp() {

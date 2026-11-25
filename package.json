@@ -1,0 +1,30 @@
+{
+  "name": "wallet-rescue-bot",
+  "version": "1.0.0",
+  "description": "Multi-chain local asset rescue CLI for compromised wallets (Ethereum EIP-7702 + MEV Bundles, Solana Sponsored Jito Bundles, Tron Stake 2.0 Energy Rescue)",
+  "type": "module",
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "eth:check": "tsx src/cli.ts eth check",
+    "eth:rescue": "tsx src/cli.ts eth rescue",
+    "sol:check": "tsx src/cli.ts sol check",
+    "sol:rescue": "tsx src/cli.ts sol rescue",
+    "trx:check": "tsx src/cli.ts trx check",
+    "trx:rescue": "tsx src/cli.ts trx rescue",
+    "typecheck": "tsc --noEmit",
+    "test:unit": "tsx src/tests/unit.test.ts"
+  },
+  "dependencies": {
+    "@solana/spl-token": "^0.4.13",
+    "@solana/web3.js": "^1.98.2",
+    "bs58": "^6.0.0",
+    "dotenv": "^16.4.7",
+    "tronweb": "^6.0.3",
+    "viem": "^2.30.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "tsx": "^4.19.4",
+    "typescript": "^5.8.3"
+  }
+}

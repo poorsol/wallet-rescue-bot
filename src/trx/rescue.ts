@@ -459,11 +459,12 @@ export async function buildOfflineSignedTrxTransfer(params: {
   return signed;
 }
 
-async function broadcastRawToNode(
+async function broadcastRawBodyToNode(
   host: string,
-  signedTx: any,
+  serializedTxBody: string,
   apiKey?: string
-): Promise<{ host: string; ok: boolean; code?: string; message?: string }> {
+): Promise<{ host: string; ok: boolean; code?: string; message?: string; elapsedMs: number }> {
+  const t0 = Date.now();
   const url = `${host.replace(/\/$/, '')}/wallet/broadcasttransaction`;
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
   if (apiKey && host.includes('trongrid')) {
@@ -475,7 +476,7 @@ async function broadcastRawToNode(
     const res = await fetch(url, {
       method: 'POST',
       headers,
-      body: JSON.stringify(signedTx),
+      body: serializedTxBody,
       signal: controller.signal,
     });
     clearTimeout(timer);
@@ -489,9 +490,15 @@ async function broadcastRawToNode(
       ok: Boolean(json.result),
       code: json.code,
       message: decodedMsg,
+      elapsedMs: Date.now() - t0,
     };
   } catch (err: any) {
-    return { host, ok: false, message: err?.message ?? String(err) };
+    return {
+      host,
+      ok: false,
+      message: err?.message ?? String(err),
+      elapsedMs: Date.now() - t0,
+    };
   }
 }
 
@@ -554,7 +561,7 @@ export async function runTrxRelay(options: TrxRelayOptions): Promise<void> {
   // unless sponsor activates it first via AccountCreateContract.
   const willActivateFirst = !recipientActivated && Boolean(options.activateRecipientFirst);
   const activationExtraSun = !recipientActivated && !willActivateFirst ? 1_100_000 : 0;
-  const bwExtraSun = availBw < 300 && activationExtraSun === 0 ? 300_000 : 0;
+  const bwExtraSun = availBw < 280 && activationExtraSun === 0 ? 300_000 : 0;
   const totalVictimNeededSun = sendSun + activationExtraSun + bwExtraSun;
   const sponsorFundSun = Math.max(0, totalVictimNeededSun - victimBalSun);
 
@@ -584,7 +591,7 @@ export async function runTrxRelay(options: TrxRelayOptions): Promise<void> {
   }
   console.log(`  Tx #1 : [Sponsor -> Victim] Kirim ${(sponsorFundSun / 1e6).toFixed(6)} TRX`);
   console.log(`  Tx #2 : [Victim -> Tujuan]  Pre-signed OFFLINE ${(sendSun / 1e6).toFixed(6)} TRX -> ${recipient}`);
-  console.log(`  Mode  : Tembak Tx#1 lalu rapid-fire Tx#2 tiap ${options.burstIntervalMs ?? 150}ms selama ${(options.burstDurationMs ?? 9000) / 1000}s`);
+  console.log(`  Mode  : ZERO-WAIT PIPELINED (tembak Tx#1 T=0ms tanpa await, langsung hujan Tx#2 mulai T=15ms!)`);
   log.warn('CATATAN: Tron tidak memiliki MEV Bundle atomik seperti Ethereum. Metode ini adalah balapan milidetik melawan sweeper — gunakan hanya untuk nominal kecil!');
 
   if (willActivateFirst && !options.dryRun) {
@@ -628,48 +635,80 @@ export async function runTrxRelay(options: TrxRelayOptions): Promise<void> {
     return;
   }
 
-  // 3. Fire Tx #1, then immediately rapid-fire pre-signed Tx #2!
-  log.info(`Menembak Tx #1 ke ${broadcastNodes.length} node...`);
-  const tx1Results = await Promise.all(
-    broadcastNodes.map((h) => broadcastRawToNode(h, tx1Signed, apiKey))
+  // 3. ZERO-WAIT PIPELINED LAUNCH:
+  // Pre-serialize both JSON payloads, fire Tx #1 at T=0ms WITHOUT awaiting its HTTP response,
+  // and immediately fire staggered waves of Tx #2 starting at T=15ms so Tx #2 arrives right behind Tx #1!
+  const tx1Body = JSON.stringify(tx1Signed);
+  const tx2Body = JSON.stringify(tx2Signed);
+
+  log.info(
+    `ZERO-WAIT LAUNCH ke ${broadcastNodes.length} node: Tx #1 @ T=0ms, gelombang Tx #2 mulai T=15ms...`
   );
+
+  const start = Date.now();
+  let tx2Accepted = false;
+  let tx2AcceptedInfo = '';
+  let lastRejectReason = '';
+  let totalTx2Shots = 0;
+
+  // Fire Tx #1 immediately (DO NOT await yet!)
+  const tx1Promise = Promise.all(
+    broadcastNodes.map((h) => broadcastRawBodyToNode(h, tx1Body, apiKey))
+  );
+
+  // Wave 1: Tight pipelined concurrent shots in the first 550ms (catches same-block pending pool!)
+  const pipelinedDelaysMs = [15, 30, 50, 75, 105, 140, 180, 230, 290, 360, 450, 550];
+  const wave1Promises = pipelinedDelaysMs.map(async (delayMs) => {
+    await sleep(delayMs);
+    if (tx2Accepted) return;
+    totalTx2Shots++;
+    const shotNo = totalTx2Shots;
+    const resList = await Promise.all(
+      broadcastNodes.map((h) => broadcastRawBodyToNode(h, tx2Body, apiKey))
+    );
+    const hit = resList.find((r) => r.ok || r.code === 'DUP_TRANSACTION_ERROR');
+    if (hit && !tx2Accepted) {
+      tx2Accepted = true;
+      tx2AcceptedInfo = `Wave1 shot #${shotNo} (delay=${delayMs}ms, selesai +${Date.now() - start}ms) di ${hit.host}`;
+      log.ok(`Tx #2 DITERIMA NODE! ${tx2AcceptedInfo}`);
+    } else if (!tx2Accepted) {
+      lastRejectReason = resList.map((r) => r.message || r.code).join(' | ');
+    }
+  });
+
+  // Wait for Tx #1 response + Wave 1 to settle
+  const [tx1Results] = await Promise.all([tx1Promise, Promise.all(wave1Promises)]);
+
   const tx1Accepted = tx1Results.some((r) => r.ok || r.code === 'DUP_TRANSACTION_ERROR');
   if (!tx1Accepted) {
     throw new Error(`Tx #1 ditolak oleh semua node: ${JSON.stringify(tx1Results)}`);
   }
-  log.ok(`Tx #1 diterima node! Langsung memulai rapid-fire Tx #2...`);
+  const tx1Best = tx1Results.find((r) => r.ok || r.code === 'DUP_TRANSACTION_ERROR');
+  log.ok(`Tx #1 diterima (${tx1Best?.host}, RTT=${tx1Best?.elapsedMs}ms).`);
 
+  // Wave 2: If Wave 1 didn't catch same-block yet, keep firing every intervalMs until next block (~3-7s)
   const intervalMs = options.burstIntervalMs ?? 150;
-  const maxDurationMs = options.burstDurationMs ?? 9000;
-  const start = Date.now();
-  let attempt = 0;
-  let tx2Accepted = false;
-  let lastRejectReason = '';
+  const maxDurationMs = options.burstDurationMs ?? 7000;
 
-  await sleep(50);
-
-  while (Date.now() - start < maxDurationMs) {
-    attempt++;
+  while (!tx2Accepted && Date.now() - start < maxDurationMs) {
+    totalTx2Shots++;
     const resList = await Promise.all(
-      broadcastNodes.map((h) => broadcastRawToNode(h, tx2Signed, apiKey))
+      broadcastNodes.map((h) => broadcastRawBodyToNode(h, tx2Body, apiKey))
     );
-
     const hit = resList.find((r) => r.ok || r.code === 'DUP_TRANSACTION_ERROR');
     if (hit) {
       tx2Accepted = true;
-      log.ok(
-        `Tx #2 DITERIMA NODE (${hit.host}) pada percobaan #${attempt} (${Date.now() - start}ms sejak Tx #1)!`
-      );
+      tx2AcceptedInfo = `Wave2 shot #${totalTx2Shots} (+${Date.now() - start}ms) di ${hit.host}`;
+      log.ok(`Tx #2 DITERIMA NODE! ${tx2AcceptedInfo}`);
       break;
     }
-
     lastRejectReason = resList.map((r) => r.message || r.code).join(' | ');
     await sleep(intervalMs);
   }
 
   if (!tx2Accepted) {
     log.err(
-      `Tx #2 belum diterima setelah ${attempt} percobaan (${maxDurationMs}ms). Alasan terakhir: ${lastRejectReason}`
+      `Tx #2 belum diterima setelah ${totalTx2Shots} tembakan (${Date.now() - start}ms). Alasan terakhir: ${lastRejectReason}`
     );
   }
 

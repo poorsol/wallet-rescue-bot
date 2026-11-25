@@ -11,6 +11,7 @@
     "sol:rescue": "tsx src/cli.ts sol rescue",
     "trx:check": "tsx src/cli.ts trx check",
     "trx:rescue": "tsx src/cli.ts trx rescue",
+    "trx:relay": "tsx src/cli.ts trx relay",
     "typecheck": "tsc --noEmit",
     "test:unit": "tsx src/tests/unit.test.ts"
   },

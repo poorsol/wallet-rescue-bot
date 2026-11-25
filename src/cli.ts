@@ -1,6 +1,6 @@
 import { checkEthWallet, runEthRescue, type EthRescueMode } from './eth/rescue.js';
 import { checkSolWallet, runSolRescue } from './sol/rescue.js';
-import { checkTrxWallet, runTrxRescue } from './trx/rescue.js';
+import { checkTrxWallet, runTrxRelay, runTrxRescue } from './trx/rescue.js';
 import { log } from './utils/config.js';
 
 function parseArgs(argv: string[]): { positional: string[]; flags: Record<string, string | boolean> } {
@@ -50,8 +50,9 @@ SOLANA:
   npm run sol:rescue -- --mode sol [--amount max|0.01] [--direct-rpc] [--dry-run]
 
 TRON:
-  npm run trx:check -- --address T... [--token TR7NHq...]
+  npm run trx:check T... [--token TR7NHq...]
   npm run trx:rescue -- [--token TR7NHq...] [--amount max] [--delegate-energy 3000] [--dry-run]
+  npm run trx:relay -- --amount 4 [--recipient T...] [--activate-first] [--dry-run]
 `);
 }
 
@@ -125,6 +126,18 @@ async function main() {
       delegateEnergyTrx: Number(strFlag(flags, 'delegate-energy') ?? '0'),
       delegateBandwidthTrx: Number(strFlag(flags, 'delegate-bandwidth') ?? '0'),
       autoReclaimResources: !boolFlag(flags, 'no-reclaim'),
+      dryRun: boolFlag(flags, 'dry-run'),
+    });
+    return;
+  }
+
+  if (chain === 'trx' && action === 'relay') {
+    await runTrxRelay({
+      recipient: strFlag(flags, 'recipient'),
+      amountTrx: Number(strFlag(flags, 'amount') ?? '4'),
+      activateRecipientFirst: boolFlag(flags, 'activate-first'),
+      burstIntervalMs: Number(strFlag(flags, 'interval') ?? '150'),
+      burstDurationMs: Number(strFlag(flags, 'duration') ?? '9000'),
       dryRun: boolFlag(flags, 'dry-run'),
     });
     return;

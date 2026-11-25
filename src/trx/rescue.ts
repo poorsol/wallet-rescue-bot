@@ -1,5 +1,5 @@
-import { TronWeb } from 'tronweb';
-import { log, optionalEnv, requireEnv, sleep } from '../utils/config.js';
+import { TronWeb, utils as tronUtils } from 'tronweb';
+import { log, optionalEnv, parseCsvEnv, requireEnv, sleep } from '../utils/config.js';
 
 const DEFAULT_USDT_TRC20 = 'TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t';
 
@@ -399,3 +399,297 @@ export async function runTrxRescue(options: TrxRescueOptions): Promise<void> {
     }
   }
 }
+
+export interface TrxRelayOptions {
+  recipient?: string;
+  amountTrx: number; // e.g., 4 TRX (~$1.23)
+  activateRecipientFirst?: boolean; // if true & recipient inactive, sponsor activates it via AccountCreateContract first
+  burstIntervalMs?: number; // default 150ms
+  burstDurationMs?: number; // default 9000ms
+  dryRun?: boolean;
+}
+
+/**
+ * Build & sign a Tron TransferContract 100% OFFLINE (works even while victim balance is 0!).
+ * Reuses node-verified TaPoS ref_block_bytes & ref_block_hash from tx1.
+ */
+export async function buildOfflineSignedTrxTransfer(params: {
+  tronWeb: TronWeb;
+  fromPrivateKey: string;
+  fromBase58: string;
+  toBase58: string;
+  amountSun: number;
+  refBlockBytes: string;
+  refBlockHash: string;
+  timestamp: number;
+  expiration: number;
+}): Promise<any> {
+  const txJson = {
+    visible: false,
+    raw_data: {
+      contract: [
+        {
+          parameter: {
+            value: {
+              amount: params.amountSun,
+              owner_address: params.tronWeb.address.toHex(params.fromBase58),
+              to_address: params.tronWeb.address.toHex(params.toBase58),
+            },
+            type_url: 'type.googleapis.com/protocol.TransferContract',
+          },
+          type: 'TransferContract',
+        },
+      ],
+      ref_block_bytes: params.refBlockBytes,
+      ref_block_hash: params.refBlockHash,
+      expiration: params.expiration,
+      timestamp: params.timestamp,
+    },
+  };
+
+  const pb = tronUtils.transaction.txJsonToPb(txJson as any);
+  const raw_data_hex = tronUtils.transaction.txPbToRawDataHex(pb);
+  const txID = tronUtils.transaction.txPbToTxID(pb).replace(/^0x/, '');
+  const fullTx = { ...txJson, txID, raw_data_hex } as any;
+  const signed = await params.tronWeb.trx.sign(fullTx, params.fromPrivateKey);
+
+  if (!tronUtils.transaction.txCheck(signed)) {
+    throw new Error('Validasi offline protobuf txCheck(tx2) gagal!');
+  }
+  return signed;
+}
+
+async function broadcastRawToNode(
+  host: string,
+  signedTx: any,
+  apiKey?: string
+): Promise<{ host: string; ok: boolean; code?: string; message?: string }> {
+  const url = `${host.replace(/\/$/, '')}/wallet/broadcasttransaction`;
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (apiKey && host.includes('trongrid')) {
+    headers['TRON-PRO-API-KEY'] = apiKey;
+  }
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 4000);
+    const res = await fetch(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(signedTx),
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+    const json: any = await res.json();
+    const decodedMsg =
+      typeof json.message === 'string' && /^[0-9a-fA-F]+$/.test(json.message)
+        ? Buffer.from(json.message, 'hex').toString('utf8')
+        : json.message;
+    return {
+      host,
+      ok: Boolean(json.result),
+      code: json.code,
+      message: decodedMsg,
+    };
+  } catch (err: any) {
+    return { host, ok: false, message: err?.message ?? String(err) };
+  }
+}
+
+export async function runTrxRelay(options: TrxRelayOptions): Promise<void> {
+  log.title('TRON MAINNET - OFFLINE PRE-SIGN & RAPID-FIRE TRX RELAY');
+
+  const sponsorKey = requireEnv('TRX_SPONSOR_PRIVATE_KEY').replace(/^0x/, '').trim();
+  const victimKey = requireEnv('TRX_VICTIM_PRIVATE_KEY').replace(/^0x/, '').trim();
+  const recipient = (options.recipient || requireEnv('TRX_SAFE_RECIPIENT')).trim();
+
+  if (!Number.isFinite(options.amountTrx) || options.amountTrx <= 0) {
+    throw new Error('Jumlah TRX tidak valid (mis. 4).');
+  }
+
+  const primaryHost = optionalEnv('TRX_FULL_HOST', 'https://api.trongrid.io');
+  const apiKey = optionalEnv('TRX_TRONGRID_API_KEY');
+  const broadcastNodes = Array.from(
+    new Set([
+      primaryHost,
+      ...parseCsvEnv('TRX_EXTRA_BROADCAST_NODES', []),
+    ])
+  );
+
+  const sponsorTron = createTronWeb(sponsorKey);
+  const victimTron = createTronWeb(victimKey);
+  const sponsorAddr = sponsorTron.defaultAddress.base58 as string;
+  const victimAddr = victimTron.defaultAddress.base58 as string;
+
+  if (!sponsorTron.isAddress(recipient)) {
+    throw new Error(`Alamat tujuan Tron tidak valid: ${recipient}`);
+  }
+
+  // 1. Audit victim permissions + check accounts & bandwidth
+  const [sponsorAcc, victimAcc, victimRes, recipientAcc] = await Promise.all([
+    sponsorTron.trx.getAccount(sponsorAddr),
+    victimTron.trx.getAccount(victimAddr),
+    victimTron.trx.getAccountResources(victimAddr),
+    sponsorTron.trx.getAccount(recipient),
+  ]);
+
+  const audit = auditTronPermissions(victimTron, victimAcc, victimAddr);
+  if (audit.isCompromisedMultiSig) {
+    log.err('BATAL OTOMATIS: Wallet korban terkena MULTI-SIG TAKEOVER!');
+    for (const r of audit.reasons) console.log(`  -> ${r}`);
+    throw new Error('Tidak bisa menjalankan TRX relay pada wallet Multi-Sig Takeover.');
+  }
+
+  const sponsorBalSun = Number(sponsorAcc?.balance ?? 0);
+  const victimBalSun = Number(victimAcc?.balance ?? 0);
+  const recipientActivated = Boolean(recipientAcc && recipientAcc.address);
+  const freeBw =
+    Number(victimRes?.freeNetLimit ?? 0) - Number(victimRes?.freeNetUsed ?? 0);
+  const stakedBw =
+    Number(victimRes?.NetLimit ?? 0) - Number(victimRes?.NetUsed ?? 0);
+  const availBw = freeBw + stakedBw;
+
+  const sendSun = Math.round(options.amountTrx * 1e6);
+
+  // If recipient is not activated on-chain, Tron burns 1.1 TRX (1 TRX create fee + 0.1 TRX bw)
+  // unless sponsor activates it first via AccountCreateContract.
+  const willActivateFirst = !recipientActivated && Boolean(options.activateRecipientFirst);
+  const activationExtraSun = !recipientActivated && !willActivateFirst ? 1_100_000 : 0;
+  const bwExtraSun = availBw < 300 && activationExtraSun === 0 ? 300_000 : 0;
+  const totalVictimNeededSun = sendSun + activationExtraSun + bwExtraSun;
+  const sponsorFundSun = Math.max(0, totalVictimNeededSun - victimBalSun);
+
+  console.log(`Sponsor Wallet    : ${sponsorAddr} (saldo: ${(sponsorBalSun / 1e6).toFixed(6)} TRX)`);
+  console.log(`Victim Wallet     : ${victimAddr} (saldo: ${(victimBalSun / 1e6).toFixed(6)} TRX, BW: ${availBw})`);
+  console.log(`Tujuan Wajib      : ${recipient} (${recipientActivated ? 'SUDAH AKTIF' : 'BELUM AKTIF ON-CHAIN!'})`);
+  console.log(`Jumlah Kirim Tx#2 : ${(sendSun / 1e6).toFixed(6)} TRX`);
+
+  if (!recipientActivated) {
+    if (willActivateFirst) {
+      log.info('Tujuan belum aktif -> Sponsor akan mengaktifkan dulu via AccountCreateContract (biaya 1 TRX dari sponsor, 0 TRX transfer ke tujuan).');
+    } else {
+      log.warn('Tujuan belum aktif -> Sponsor otomatis menambah +1.1 TRX biaya aktivasi protokol di Tx#1 (total terkirim ke korban = jumlah kirim + 1.1 TRX, sisa korban = 0 TRX).');
+    }
+  }
+
+  const sponsorNeedWithSafety = sponsorFundSun + (willActivateFirst ? 1_200_000 : 300_000);
+  if (sponsorBalSun < sponsorNeedWithSafety) {
+    throw new Error(
+      `Saldo Sponsor kurang! Butuh minimal ~${(sponsorNeedWithSafety / 1e6).toFixed(2)} TRX, saldo saat ini ${(sponsorBalSun / 1e6).toFixed(6)} TRX.`
+    );
+  }
+
+  console.log('\n--- RENCANA EKSEKUSI ---');
+  if (willActivateFirst) {
+    console.log(`  Step 0: [Sponsor] Aktivasi akun ${recipient} via AccountCreateContract (biaya 1 TRX)`);
+  }
+  console.log(`  Tx #1 : [Sponsor -> Victim] Kirim ${(sponsorFundSun / 1e6).toFixed(6)} TRX`);
+  console.log(`  Tx #2 : [Victim -> Tujuan]  Pre-signed OFFLINE ${(sendSun / 1e6).toFixed(6)} TRX -> ${recipient}`);
+  console.log(`  Mode  : Tembak Tx#1 lalu rapid-fire Tx#2 tiap ${options.burstIntervalMs ?? 150}ms selama ${(options.burstDurationMs ?? 9000) / 1000}s`);
+  log.warn('CATATAN: Tron tidak memiliki MEV Bundle atomik seperti Ethereum. Metode ini adalah balapan milidetik melawan sweeper — gunakan hanya untuk nominal kecil!');
+
+  if (willActivateFirst && !options.dryRun) {
+    log.info('Menjalankan Step 0: Aktivasi alamat tujuan dari Sponsor...');
+    const createTx = await sponsorTron.transactionBuilder.createAccount(recipient, sponsorAddr);
+    const signedCreate = await sponsorTron.trx.sign(createTx);
+    const createRes = await sponsorTron.trx.sendRawTransaction(signedCreate);
+    if (!createRes.result) {
+      throw new Error(`Gagal aktivasi akun tujuan: ${JSON.stringify(createRes)}`);
+    }
+    log.ok(`Aktivasi terkirim: https://tronscan.org/#/transaction/${createRes.txid} (tunggu 4 detik...)`);
+    await sleep(4000);
+  }
+
+  // 2. Build & sign Tx #1 on sponsor, then IMMEDIATELY build & sign Tx #2 OFFLINE using Tx #1's exact TaPoS!
+  const tx1Unsigned = await sponsorTron.transactionBuilder.sendTrx(
+    victimAddr,
+    sponsorFundSun,
+    sponsorAddr
+  );
+  const tx1Signed = await sponsorTron.trx.sign(tx1Unsigned);
+
+  const tx2Signed = await buildOfflineSignedTrxTransfer({
+    tronWeb: victimTron,
+    fromPrivateKey: victimKey,
+    fromBase58: victimAddr,
+    toBase58: recipient,
+    amountSun: sendSun,
+    refBlockBytes: tx1Unsigned.raw_data.ref_block_bytes,
+    refBlockHash: tx1Unsigned.raw_data.ref_block_hash,
+    timestamp: Number(tx1Unsigned.raw_data.timestamp) + 1,
+    expiration: Number(tx1Unsigned.raw_data.expiration),
+  });
+
+  console.log('\n--- PRE-SIGNED TX READY ---');
+  console.log(`  Tx #1 (Sponsor -> Victim) : ${tx1Signed.txID}`);
+  console.log(`  Tx #2 (Victim -> Tujuan)  : ${tx2Signed.txID}`);
+
+  if (options.dryRun) {
+    log.ok('Mode DRY-RUN selesai! Kedua transaksi valid (txCheck=true) dan siap ditembak. Tidak ada yang dikirim.');
+    return;
+  }
+
+  // 3. Fire Tx #1, then immediately rapid-fire pre-signed Tx #2!
+  log.info(`Menembak Tx #1 ke ${broadcastNodes.length} node...`);
+  const tx1Results = await Promise.all(
+    broadcastNodes.map((h) => broadcastRawToNode(h, tx1Signed, apiKey))
+  );
+  const tx1Accepted = tx1Results.some((r) => r.ok || r.code === 'DUP_TRANSACTION_ERROR');
+  if (!tx1Accepted) {
+    throw new Error(`Tx #1 ditolak oleh semua node: ${JSON.stringify(tx1Results)}`);
+  }
+  log.ok(`Tx #1 diterima node! Langsung memulai rapid-fire Tx #2...`);
+
+  const intervalMs = options.burstIntervalMs ?? 150;
+  const maxDurationMs = options.burstDurationMs ?? 9000;
+  const start = Date.now();
+  let attempt = 0;
+  let tx2Accepted = false;
+  let lastRejectReason = '';
+
+  await sleep(50);
+
+  while (Date.now() - start < maxDurationMs) {
+    attempt++;
+    const resList = await Promise.all(
+      broadcastNodes.map((h) => broadcastRawToNode(h, tx2Signed, apiKey))
+    );
+
+    const hit = resList.find((r) => r.ok || r.code === 'DUP_TRANSACTION_ERROR');
+    if (hit) {
+      tx2Accepted = true;
+      log.ok(
+        `Tx #2 DITERIMA NODE (${hit.host}) pada percobaan #${attempt} (${Date.now() - start}ms sejak Tx #1)!`
+      );
+      break;
+    }
+
+    lastRejectReason = resList.map((r) => r.message || r.code).join(' | ');
+    await sleep(intervalMs);
+  }
+
+  if (!tx2Accepted) {
+    log.err(
+      `Tx #2 belum diterima setelah ${attempt} percobaan (${maxDurationMs}ms). Alasan terakhir: ${lastRejectReason}`
+    );
+  }
+
+  // 4. Verify on-chain receipt after ~6s
+  log.info('Menunggu 6 detik untuk verifikasi hasil on-chain di TronScan...');
+  await sleep(6000);
+
+  const [info1, info2] = await Promise.all([
+    sponsorTron.trx.getTransactionInfo(tx1Signed.txID),
+    victimTron.trx.getTransactionInfo(tx2Signed.txID),
+  ]);
+
+  console.log('\n--- HASIL ON-CHAIN ---');
+  console.log(`  Tx #1: https://tronscan.org/#/transaction/${tx1Signed.txID} (${info1?.id ? 'CONFIRMED' : 'PENDING/CHECK'})`);
+  console.log(`  Tx #2: https://tronscan.org/#/transaction/${tx2Signed.txID} (${info2?.id ? 'CONFIRMED' : 'NOT FOUND / CHECK'})`);
+
+  if (info2?.id && (!info2?.receipt?.result || info2.receipt.result === 'SUCCESS')) {
+    log.ok(`BERHASIL! ${(sendSun / 1e6).toFixed(6)} TRX sukses terkirim dari ${victimAddr} ke ${recipient}!`);
+  } else {
+    log.warn('Cek langsung link TronScan di atas untuk memastikan status akhir Tx #2 (apakah menang balapan atau kalah dengan sweeper).');
+  }
+}
+

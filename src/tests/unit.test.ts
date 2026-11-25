@@ -10,7 +10,7 @@ import {
   parseEip7702Delegation,
 } from '../utils/config.js';
 import { parseSolKeypair } from '../sol/rescue.js';
-import { auditTronPermissions } from '../trx/rescue.js';
+import { auditTronPermissions, buildOfflineSignedTrxTransfer } from '../trx/rescue.js';
 
 async function runTests() {
   console.log('1. Testing EIP-7702 delegation bytecode detection...');
@@ -134,6 +134,23 @@ async function runTests() {
     victimTrx.address.base58
   );
   assert.equal(hijackedAudit.isCompromisedMultiSig, true);
+  console.log('   PASS');
+
+  console.log('6. Testing Tron offline pre-signed TransferContract (0 balance victim)...');
+  const now = Date.now();
+  const signedTrx = await buildOfflineSignedTrxTransfer({
+    tronWeb: tw,
+    fromPrivateKey: victimTrx.privateKey,
+    fromBase58: victimTrx.address.base58,
+    toBase58: attackerTrx.address.base58,
+    amountSun: 4_000_000,
+    refBlockBytes: 'abcd',
+    refBlockHash: '0123456789abcdef',
+    timestamp: now,
+    expiration: now + 60_000,
+  });
+  assert.ok(typeof signedTrx.txID === 'string' && signedTrx.txID.length === 64);
+  assert.ok(Array.isArray(signedTrx.signature) && signedTrx.signature.length === 1);
   console.log('   PASS');
 
   console.log('\nALL UNIT TESTS PASSED!');

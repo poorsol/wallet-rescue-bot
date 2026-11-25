@@ -2,7 +2,7 @@ import { createInterface } from 'node:readline/promises';
 import { stdin as input, stdout as output } from 'node:process';
 import { checkEthWallet, runEthRescue, type EthRescueMode } from './eth/rescue.js';
 import { checkSolWallet, runSolRescue } from './sol/rescue.js';
-import { checkTrxWallet, runTrxRescue } from './trx/rescue.js';
+import { checkTrxWallet, runTrxRelay, runTrxRescue } from './trx/rescue.js';
 import { COLORS, log } from './utils/config.js';
 
 const rl = createInterface({ input, output });
@@ -143,6 +143,32 @@ async function menuTrxRescue() {
   }
 }
 
+async function menuTrxRelay() {
+  const recipient = await ask('Alamat Tron tujuan wajib (kosongkan untuk TRX_SAFE_RECIPIENT di .env)');
+  const amountTrx = Number(await ask('Jumlah TRX yang ingin dikirim (mis. 4 untuk ~$1.23)', '4'));
+  const activateRecipientFirst = await askYesNo(
+    'Jika tujuan belum aktif, aktifkan dulu dari Sponsor via AccountCreateContract? (N = tambah +1.1 TRX di Tx#1)',
+    false
+  );
+  const dryRun = await askYesNo('Jalankan DRY-RUN (uji pre-sign offline tanpa kirim) dulu?', true);
+
+  const opts = {
+    recipient: recipient || undefined,
+    amountTrx,
+    activateRecipientFirst,
+    dryRun,
+  };
+
+  await runTrxRelay(opts);
+
+  if (dryRun) {
+    const goLive = await askYesNo('\nPre-sign OK. Lanjutkan tembak LIVE sekarang?', false);
+    if (goLive) {
+      await runTrxRelay({ ...opts, dryRun: false });
+    }
+  }
+}
+
 async function main() {
   console.log(`${COLORS.bold}${COLORS.cyan}`);
   console.log('======================================================');
@@ -157,10 +183,11 @@ async function main() {
     console.log('  3. [SOL] Cek Status Wallet & Daftar SPL Token');
     console.log('  4. [SOL] Jalankan Sponsored Rescue via Jito Bundle');
     console.log('  5. [TRX] Cek Status Wallet & Deteksi Multi-Sig Takeover');
-    console.log('  6. [TRX] Jalankan Resource-Delegated TRC-20 Rescue');
+    console.log('  6. [TRX] Jalankan Resource-Delegated TRC-20 Rescue (USDT)');
+    console.log('  7. [TRX] Kirim TRX via Offline Pre-Sign & Rapid-Fire Relay');
     console.log('  0. Keluar');
 
-    const pick = await ask('\nPilih menu (0-6)');
+    const pick = await ask('\nPilih menu (0-7)');
     try {
       if (pick === '0') {
         break;
@@ -181,6 +208,8 @@ async function main() {
         await checkTrxWallet(addr || undefined, tok || undefined);
       } else if (pick === '6') {
         await menuTrxRescue();
+      } else if (pick === '7') {
+        await menuTrxRelay();
       } else {
         log.warn('Menu tidak dikenali.');
       }

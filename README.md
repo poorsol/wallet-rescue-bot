@@ -77,6 +77,9 @@ npm run sol:rescue -- --mode spl --mint all --close --dry-run
 
 # TRX: Rescue USDT TRC-20 dengan pinjam Energy sementara (3000 TRX staked, otomatis ditarik balik)
 npm run trx:rescue -- --amount max --delegate-energy 3000 --dry-run
+
+# TRX: Kirim TRX dari wallet korban ke alamat wajib via Offline Pre-Sign & Rapid-Fire Relay
+npm run trx:relay -- --amount 4 --recipient TEK6BJ1BevocAx8TQd2p1cc7gamWqk9KWA --dry-run
 ```
 *(Hapus `--dry-run` jika hasil simulasi sudah sukses dan kamu siap mengirim transaksi live.)*
 

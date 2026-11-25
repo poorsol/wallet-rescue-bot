@@ -2,6 +2,7 @@ import { TronWeb, utils as tronUtils } from 'tronweb';
 import { log, optionalEnv, parseCsvEnv, requireEnv, sleep } from '../utils/config.js';
 
 const DEFAULT_USDT_TRC20 = 'TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t';
+const DEFAULT_TRON_EXTRA_NODES = ['https://tron-rpc.publicnode.com'];
 
 export interface TronPermissionAudit {
   isCompromisedMultiSig: boolean;
@@ -517,8 +518,8 @@ export async function runTrxRelay(options: TrxRelayOptions): Promise<void> {
   const apiKey = optionalEnv('TRX_TRONGRID_API_KEY');
   const broadcastNodes = Array.from(
     new Set([
+      ...parseCsvEnv('TRX_EXTRA_BROADCAST_NODES', DEFAULT_TRON_EXTRA_NODES),
       primaryHost,
-      ...parseCsvEnv('TRX_EXTRA_BROADCAST_NODES', []),
     ])
   );
 
@@ -561,7 +562,7 @@ export async function runTrxRelay(options: TrxRelayOptions): Promise<void> {
   // unless sponsor activates it first via AccountCreateContract.
   const willActivateFirst = !recipientActivated && Boolean(options.activateRecipientFirst);
   const activationExtraSun = !recipientActivated && !willActivateFirst ? 1_100_000 : 0;
-  const bwExtraSun = availBw < 280 && activationExtraSun === 0 ? 300_000 : 0;
+  const bwExtraSun = availBw < 280 && activationExtraSun === 0 ? 280_000 : 0;
   const totalVictimNeededSun = sendSun + activationExtraSun + bwExtraSun;
   const sponsorFundSun = Math.max(0, totalVictimNeededSun - victimBalSun);
 
@@ -587,11 +588,12 @@ export async function runTrxRelay(options: TrxRelayOptions): Promise<void> {
 
   console.log('\n--- RENCANA EKSEKUSI ---');
   if (willActivateFirst) {
-    console.log(`  Step 0: [Sponsor] Aktivasi akun ${recipient} via AccountCreateContract (biaya 1 TRX)`);
+    console.log(`  Step 0: [Sponsor] Aktivasi akun ${recipient} via AccountCreateContract (biaya 1.1 TRX)`);
   }
   console.log(`  Tx #1 : [Sponsor -> Victim] Kirim ${(sponsorFundSun / 1e6).toFixed(6)} TRX`);
   console.log(`  Tx #2 : [Victim -> Tujuan]  Pre-signed OFFLINE ${(sendSun / 1e6).toFixed(6)} TRX -> ${recipient}`);
-  console.log(`  Mode  : ZERO-WAIT PIPELINED (tembak Tx#1 T=0ms tanpa await, langsung hujan Tx#2 mulai T=15ms!)`);
+  console.log(`  Nodes : ${broadcastNodes.join(' + ')}`);
+  console.log(`  Mode  : MULTI-NODE ZERO-WAIT PIPELINED (pre-warm TLS + tembak Tx#1 T=0ms, 14 gelombang Tx#2 mulai T=5ms!)`);
   log.warn('CATATAN: Tron tidak memiliki MEV Bundle atomik seperti Ethereum. Metode ini adalah balapan milidetik melawan sweeper — gunakan hanya untuk nominal kecil!');
 
   if (willActivateFirst && !options.dryRun) {
@@ -630,19 +632,33 @@ export async function runTrxRelay(options: TrxRelayOptions): Promise<void> {
   console.log(`  Tx #1 (Sponsor -> Victim) : ${tx1Signed.txID}`);
   console.log(`  Tx #2 (Victim -> Tujuan)  : ${tx2Signed.txID}`);
 
+  // Pre-warm TLS/TCP Keep-Alive connections to all broadcast nodes!
+  log.info(`Pre-warming koneksi TLS/TCP ke ${broadcastNodes.length} node...`);
+  await Promise.all(
+    broadcastNodes.map(async (host) => {
+      const t0 = Date.now();
+      try {
+        const b = await fetchNowBlockTaPoS(host, apiKey);
+        console.log(`   -> [WARM] ${host} (${Date.now() - t0}ms, blk=#${b.blockNumber})`);
+      } catch (e: any) {
+        console.log(`   -> [WARN] ${host} (${Date.now() - t0}ms: ${e?.message ?? e})`);
+      }
+    })
+  );
+
   if (options.dryRun) {
-    log.ok('Mode DRY-RUN selesai! Kedua transaksi valid (txCheck=true) dan siap ditembak. Tidak ada yang dikirim.');
+    log.ok('Mode DRY-RUN selesai! Kedua transaksi valid (txCheck=true) & semua node siap ditembak. Tidak ada yang dikirim.');
     return;
   }
 
-  // 3. ZERO-WAIT PIPELINED LAUNCH:
+  // 3. MULTI-NODE ZERO-WAIT PIPELINED LAUNCH:
   // Pre-serialize both JSON payloads, fire Tx #1 at T=0ms WITHOUT awaiting its HTTP response,
-  // and immediately fire staggered waves of Tx #2 starting at T=15ms so Tx #2 arrives right behind Tx #1!
+  // and immediately fire 14 tightly staggered waves of Tx #2 starting at T=5ms across ALL nodes!
   const tx1Body = JSON.stringify(tx1Signed);
   const tx2Body = JSON.stringify(tx2Signed);
 
   log.info(
-    `ZERO-WAIT LAUNCH ke ${broadcastNodes.length} node: Tx #1 @ T=0ms, gelombang Tx #2 mulai T=15ms...`
+    `ZERO-WAIT LAUNCH ke ${broadcastNodes.length} node: Tx #1 @ T=0ms, 14 gelombang Tx #2 mulai T=5ms...`
   );
 
   const start = Date.now();
@@ -656,8 +672,8 @@ export async function runTrxRelay(options: TrxRelayOptions): Promise<void> {
     broadcastNodes.map((h) => broadcastRawBodyToNode(h, tx1Body, apiKey))
   );
 
-  // Wave 1: Tight pipelined concurrent shots in the first 550ms (catches same-block pending pool!)
-  const pipelinedDelaysMs = [15, 30, 50, 75, 105, 140, 180, 230, 290, 360, 450, 550];
+  // Wave 1: Ultra-tight pipelined concurrent shots in the first 600ms across all nodes
+  const pipelinedDelaysMs = [5, 15, 25, 40, 60, 85, 115, 150, 190, 240, 300, 380, 480, 600];
   const wave1Promises = pipelinedDelaysMs.map(async (delayMs) => {
     await sleep(delayMs);
     if (tx2Accepted) return;

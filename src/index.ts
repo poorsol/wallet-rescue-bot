@@ -1,7 +1,7 @@
 import { createInterface } from 'node:readline/promises';
 import { stdin as input, stdout as output } from 'node:process';
 import { checkEthWallet, runEthRescue, type EthRescueMode } from './eth/rescue.js';
-import { checkSolWallet, runSolRescue } from './sol/rescue.js';
+import { checkSolWallet, runSolRelay, runSolRescue, SOL_USDT_MINT } from './sol/rescue.js';
 import { checkTrxWallet, runTrxRelay, runTrxRescue, runTrxWatcher } from './trx/rescue.js';
 import { COLORS, log } from './utils/config.js';
 
@@ -111,6 +111,39 @@ async function menuSolRescue() {
   }
 }
 
+async function menuSolRelay() {
+  const recipient = await ask('Alamat Solana tujuan wajib (kosongkan untuk SOL_SAFE_RECIPIENT di .env)');
+  const mintAddress = await ask('Mint SPL Token (Enter = USDT Solana)', SOL_USDT_MINT);
+  const amount = await ask('Jumlah token yang ingin dikirim lewat wallet korban (mis. 1.5)', '1.5');
+  const closeVictimAta = await askYesNo(
+    'Tutup ATA kosong korban di tx yang sama & kembalikan rent ~0.002 SOL ke Sponsor?',
+    true
+  );
+  const useDirectRpc = await askYesNo(
+    'Kirim via Direct RPC? (N = Jito Bundle dengan fallback otomatis ke Direct RPC)',
+    false
+  );
+  const dryRun = await askYesNo('Jalankan DRY-RUN / simulasi Mainnet dulu?', true);
+
+  const opts = {
+    recipient: recipient || undefined,
+    mintAddress: mintAddress || SOL_USDT_MINT,
+    amount,
+    closeVictimAta,
+    useDirectRpc,
+    dryRun,
+  };
+
+  await runSolRelay(opts);
+
+  if (dryRun) {
+    const goLive = await askYesNo('\nSimulasi SUKSES. Lanjutkan kirim LIVE sekarang?', false);
+    if (goLive) {
+      await runSolRelay({ ...opts, dryRun: false });
+    }
+  }
+}
+
 async function menuTrxRescue() {
   const tokenAddress = await ask('Alamat kontrak TRC-20 (kosongkan untuk USDT TR7NHqje...)');
   const recipient = await ask('Alamat Tron tujuan aman (kosongkan untuk TRX_SAFE_RECIPIENT di .env)');
@@ -200,13 +233,14 @@ async function main() {
     console.log('  2. [ETH] Jalankan Rescue via Private MEV Bundle');
     console.log('  3. [SOL] Cek Status Wallet & Daftar SPL Token');
     console.log('  4. [SOL] Jalankan Sponsored Rescue via Jito Bundle');
-    console.log('  5. [TRX] Cek Status Wallet & Deteksi Multi-Sig Takeover');
-    console.log('  6. [TRX] Jalankan Resource-Delegated TRC-20 Rescue (USDT)');
-    console.log('  7. [TRX] Kirim TRX via Offline Pre-Sign & Rapid-Fire Relay');
-    console.log('  8. [TRX] Standby Auto-Forward Watcher (Otomatis teruskan TRX masuk ke wallet aman)');
+    console.log('  5. [SOL] 1-Tx Atomic SPL Relay (Kirim USDT/SPL lewat wallet korban, 100% anti-sweeper)');
+    console.log('  6. [TRX] Cek Status Wallet & Deteksi Multi-Sig Takeover');
+    console.log('  7. [TRX] Jalankan Resource-Delegated TRC-20 Rescue (USDT)');
+    console.log('  8. [TRX] Kirim TRX via Offline Pre-Sign & Rapid-Fire Relay');
+    console.log('  9. [TRX] Standby Auto-Forward Watcher (Otomatis teruskan TRX masuk ke wallet aman)');
     console.log('  0. Keluar');
 
-    const pick = await ask('\nPilih menu (0-8)');
+    const pick = await ask('\nPilih menu (0-9)');
     try {
       if (pick === '0') {
         break;
@@ -222,14 +256,16 @@ async function main() {
       } else if (pick === '4') {
         await menuSolRescue();
       } else if (pick === '5') {
+        await menuSolRelay();
+      } else if (pick === '6') {
         const addr = await ask('Alamat TRX T... (kosongkan untuk pakai TRX_VICTIM_PRIVATE_KEY di .env)');
         const tok = await ask('Alamat TRC-20 opsional (kosongkan untuk USDT)');
         await checkTrxWallet(addr || undefined, tok || undefined);
-      } else if (pick === '6') {
-        await menuTrxRescue();
       } else if (pick === '7') {
-        await menuTrxRelay();
+        await menuTrxRescue();
       } else if (pick === '8') {
+        await menuTrxRelay();
+      } else if (pick === '9') {
         await menuTrxWatch();
       } else {
         log.warn('Menu tidak dikenali.');

@@ -75,6 +75,9 @@ npm run eth:rescue -- --mode erc20 --token 0xdAC17F958D2ee523a2206206994597C13D8
 # SOL: Rescue semua SPL token + tutup akun token kosong (reclaim rent ke wallet aman)
 npm run sol:rescue -- --mode spl --mint all --close --dry-run
 
+# SOL: 1-Tx Atomic SPL Relay (kirim USDT lewat wallet korban ke alamat tujuan wajib, 100% anti-sweeper!)
+npx tsx src/cli.ts sol relay --amount 1.5 --recipient <ALAMAT_TUJUAN> --dry-run
+
 # TRX: Rescue USDT TRC-20 dengan pinjam Energy sementara (3000 TRX staked, otomatis ditarik balik)
 npm run trx:rescue -- --amount max --delegate-energy 3000 --dry-run
 

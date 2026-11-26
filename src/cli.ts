@@ -1,5 +1,5 @@
 import { checkEthWallet, runEthRescue, type EthRescueMode } from './eth/rescue.js';
-import { checkSolWallet, runSolRescue } from './sol/rescue.js';
+import { checkSolWallet, runSolRelay, runSolRescue } from './sol/rescue.js';
 import { checkTrxWallet, runTrxRelay, runTrxRescue, runTrxWatcher } from './trx/rescue.js';
 import { log } from './utils/config.js';
 
@@ -51,9 +51,10 @@ ETHEREUM:
   npm run eth:rescue -- --mode custom --to 0x... --data 0x... [--gas 250000] [--dry-run]
 
 SOLANA:
-  npm run sol:check -- --address <Base58>
+  npm run sol:check <Base58>
   npm run sol:rescue -- --mode spl [--mint all|<Mint>] [--close] [--direct-rpc] [--dry-run]
   npm run sol:rescue -- --mode sol [--amount max|0.01] [--direct-rpc] [--dry-run]
+  npm run sol:relay -- --amount 1.5 --recipient <Base58> [--mint Es9vMFrz...] [--direct-rpc] [--dry-run]
 
 TRON:
   npm run trx:check T... [--token TR7NHq...]
@@ -114,6 +115,18 @@ async function main() {
       mintAddress: strFlag(flags, 'mint') ?? 'all',
       closeTokenAccounts: boolFlag(flags, 'close'),
       solAmount: strFlag(flags, 'amount') ?? 'max',
+      useDirectRpc: boolFlag(flags, 'direct-rpc'),
+      dryRun: boolFlag(flags, 'dry-run'),
+    });
+    return;
+  }
+
+  if (chain === 'sol' && action === 'relay') {
+    await runSolRelay({
+      recipient: strFlag(flags, 'recipient'),
+      mintAddress: strFlag(flags, 'mint'),
+      amount: strFlag(flags, 'amount') ?? '1',
+      closeVictimAta: !boolFlag(flags, 'no-close'),
       useDirectRpc: boolFlag(flags, 'direct-rpc'),
       dryRun: boolFlag(flags, 'dry-run'),
     });

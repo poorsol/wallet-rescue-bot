@@ -16,6 +16,7 @@ import {
   createCloseAccountInstruction,
   createTransferCheckedInstruction,
   getAssociatedTokenAddressSync,
+  getMint,
 } from '@solana/spl-token';
 import bs58 from 'bs58';
 import {
@@ -464,6 +465,330 @@ export async function runSolRescue(options: SolRescueOptions): Promise<void> {
           `Bundle belum terkonfirmasi dalam 45 detik. Cek manual di https://solscan.io/tx/${txSignature} atau naikkan SOL_JITO_TIP_LAMPORTS.`
         );
       }
+    }
+  }
+}
+
+export const SOL_USDT_MINT = 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB';
+export const SOL_USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
+
+export interface SolRelayOptions {
+  recipient?: string;
+  mintAddress?: string; // default USDT Solana (Es9vMFrz...)
+  amount: string; // human amount, e.g. "1.5"
+  closeVictimAta?: boolean; // default true: reclaim ~0.002039 SOL rent back to sponsor in same tx
+  jitoTipLamports?: number;
+  useDirectRpc?: boolean;
+  dryRun?: boolean;
+}
+
+export function buildAtomicSplRelayInstructions(params: {
+  sponsor: PublicKey;
+  victim: PublicKey;
+  recipient: PublicKey;
+  mint: PublicKey;
+  programId: PublicKey;
+  amountRaw: bigint;
+  decimals: number;
+  closeVictimAta: boolean;
+}): {
+  sponsorAta: PublicKey;
+  victimAta: PublicKey;
+  recipientAta: PublicKey;
+  instructions: TransactionInstruction[];
+} {
+  const sponsorAta = getAssociatedTokenAddressSync(
+    params.mint,
+    params.sponsor,
+    false,
+    params.programId
+  );
+  const victimAta = getAssociatedTokenAddressSync(
+    params.mint,
+    params.victim,
+    true,
+    params.programId
+  );
+  const recipientAta = getAssociatedTokenAddressSync(
+    params.mint,
+    params.recipient,
+    true,
+    params.programId
+  );
+
+  const instructions: TransactionInstruction[] = [
+    // 1. Ensure victim ATA exists (paid by sponsor)
+    createAssociatedTokenAccountIdempotentInstruction(
+      params.sponsor,
+      victimAta,
+      params.victim,
+      params.mint,
+      params.programId
+    ),
+    // 2. Ensure recipient ATA exists (paid by sponsor)
+    createAssociatedTokenAccountIdempotentInstruction(
+      params.sponsor,
+      recipientAta,
+      params.recipient,
+      params.mint,
+      params.programId
+    ),
+    // 3. Sponsor -> Victim (exact token amount)
+    createTransferCheckedInstruction(
+      sponsorAta,
+      params.mint,
+      victimAta,
+      params.sponsor,
+      params.amountRaw,
+      params.decimals,
+      [],
+      params.programId
+    ),
+    // 4. Victim -> Recipient (exact token amount, SAME ATOMIC TRANSACTION!)
+    createTransferCheckedInstruction(
+      victimAta,
+      params.mint,
+      recipientAta,
+      params.victim,
+      params.amountRaw,
+      params.decimals,
+      [],
+      params.programId
+    ),
+  ];
+
+  // 5. Close victim's now-empty ATA & return ~0.00203928 SOL rent directly to Sponsor
+  if (params.closeVictimAta) {
+    instructions.push(
+      createCloseAccountInstruction(
+        victimAta,
+        params.sponsor,
+        params.victim,
+        [],
+        params.programId
+      )
+    );
+  }
+
+  return { sponsorAta, victimAta, recipientAta, instructions };
+}
+
+function parseTokenAmountToRaw(amountStr: string, decimals: number): bigint {
+  const clean = amountStr.trim();
+  if (!/^\d+(\.\d+)?$/.test(clean)) {
+    throw new Error(`Format jumlah token tidak valid: "${amountStr}"`);
+  }
+  const [whole, frac = ''] = clean.split('.');
+  if (frac.length > decimals) {
+    throw new Error(`Terlalu banyak angka desimal (maks ${decimals} desimal).`);
+  }
+  const paddedFrac = frac.padEnd(decimals, '0');
+  return BigInt(whole) * 10n ** BigInt(decimals) + BigInt(paddedFrac || '0');
+}
+
+export async function runSolRelay(options: SolRelayOptions): Promise<void> {
+  log.title('SOLANA MAINNET - 1-TX ATOMIC SPL TOKEN RELAY (ANTI-SWEEPER 100%)');
+
+  const connection = getSolConnection();
+  const sponsor = parseSolKeypair(
+    requireEnv('SOL_SPONSOR_PRIVATE_KEY'),
+    'SOL_SPONSOR_PRIVATE_KEY'
+  );
+  const victim = parseSolKeypair(
+    requireEnv('SOL_VICTIM_PRIVATE_KEY'),
+    'SOL_VICTIM_PRIVATE_KEY'
+  );
+  const recipient = new PublicKey(
+    (options.recipient || requireEnv('SOL_SAFE_RECIPIENT')).trim()
+  );
+  const mintPubkey = new PublicKey((options.mintAddress || SOL_USDT_MINT).trim());
+
+  const jitoTipLamports =
+    options.jitoTipLamports ?? Number(optionalEnv('SOL_JITO_TIP_LAMPORTS', '100000'));
+  const jitoEndpoints = parseCsvEnv('SOL_JITO_ENDPOINTS', DEFAULT_JITO_ENDPOINTS);
+
+  // 1. Inspect mint account to auto-detect Token Program (SPL vs Token-2022) & decimals
+  const mintAccInfo = await connection.getAccountInfo(mintPubkey);
+  if (!mintAccInfo) {
+    throw new Error(`Mint token tidak ditemukan di Solana Mainnet: ${mintPubkey.toBase58()}`);
+  }
+  const programId = mintAccInfo.owner.equals(TOKEN_2022_PROGRAM_ID)
+    ? TOKEN_2022_PROGRAM_ID
+    : TOKEN_PROGRAM_ID;
+  const mintInfo = await getMint(connection, mintPubkey, 'confirmed', programId);
+  const decimals = mintInfo.decimals;
+  const amountRaw = parseTokenAmountToRaw(options.amount, decimals);
+  if (amountRaw <= 0n) {
+    throw new Error('Jumlah token harus lebih besar dari 0.');
+  }
+
+  // 2. Check Sponsor SOL + Sponsor token balance + Victim existing ATA balance
+  const sponsorAta = getAssociatedTokenAddressSync(mintPubkey, sponsor.publicKey, false, programId);
+  const victimAta = getAssociatedTokenAddressSync(mintPubkey, victim.publicKey, true, programId);
+
+  const [sponsorSolBal, sponsorAtaInfo, victimAtaInfo, victimAccInfo] = await Promise.all([
+    connection.getBalance(sponsor.publicKey),
+    connection.getParsedAccountInfo(sponsorAta),
+    connection.getParsedAccountInfo(victimAta),
+    connection.getAccountInfo(victim.publicKey),
+  ]);
+
+  const sponsorTokenRaw = BigInt(
+    (sponsorAtaInfo.value?.data as any)?.parsed?.info?.tokenAmount?.amount ?? '0'
+  );
+  const victimExistingRaw = BigInt(
+    (victimAtaInfo.value?.data as any)?.parsed?.info?.tokenAmount?.amount ?? '0'
+  );
+
+  const wantClose = options.closeVictimAta !== false;
+  const canCloseVictimAta = wantClose && victimExistingRaw === 0n;
+
+  console.log(`Sponsor (FeePayer): ${sponsor.publicKey.toBase58()} (${(sponsorSolBal / LAMPORTS_PER_SOL).toFixed(6)} SOL)`);
+  console.log(`Victim (Signer)   : ${victim.publicKey.toBase58()}`);
+  if (victimAccInfo && !victimAccInfo.owner.equals(SystemProgram.programId)) {
+    log.info(
+      `Info: Owner akun SOL korban adalah ${victimAccInfo.owner.toBase58()} (terkunci untuk SOL), TAPI tetap 100% SAH untuk SPL Token relay!`
+    );
+  }
+  console.log(`Tujuan Wajib      : ${recipient.toBase58()}`);
+  console.log(`Mint Token        : ${mintPubkey.toBase58()} (decimals=${decimals}, ${programId.equals(TOKEN_2022_PROGRAM_ID) ? 'Token-2022' : 'SPL'})`);
+  console.log(`Jumlah Relay      : ${options.amount} (raw=${amountRaw})`);
+  console.log(`Saldo Token Spons.: ${Number(sponsorTokenRaw) / 10 ** decimals}`);
+  console.log(`Close Victim ATA  : ${canCloseVictimAta ? 'YA (rent ~0.002039 SOL otomatis balik ke Sponsor)' : 'Tidak'}`);
+  console.log(`Mode Kirim        : ${options.useDirectRpc ? 'Direct RPC (tetap 100% atomik dalam 1 tx!)' : `Jito Private Bundle (tip=${jitoTipLamports} lamports)`}`);
+
+  if (sponsorTokenRaw < amountRaw) {
+    throw new Error(
+      `Saldo token di wallet Sponsor tidak cukup! Punya ${Number(sponsorTokenRaw) / 10 ** decimals}, butuh ${options.amount}.`
+    );
+  }
+  if (sponsorSolBal < 4_500_000) {
+    throw new Error(
+      `Saldo SOL Sponsor terlalu kecil (${(sponsorSolBal / LAMPORTS_PER_SOL).toFixed(6)} SOL). Isi minimal ~0.005 SOL di Sponsor untuk biaya tx + pembuatan ATA.`
+    );
+  }
+
+  // 3. Build single atomic transaction
+  const { instructions } = buildAtomicSplRelayInstructions({
+    sponsor: sponsor.publicKey,
+    victim: victim.publicKey,
+    recipient,
+    mint: mintPubkey,
+    programId,
+    amountRaw,
+    decimals,
+    closeVictimAta: canCloseVictimAta,
+  });
+
+  const fullInstructions: TransactionInstruction[] = [
+    ComputeBudgetProgram.setComputeUnitLimit({ units: 250_000 }),
+    ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 25_000 }),
+    ...instructions,
+  ];
+
+  if (!options.useDirectRpc && jitoTipLamports > 0) {
+    const tipAccount = new PublicKey(
+      JITO_TIP_ACCOUNTS[Math.floor(Math.random() * JITO_TIP_ACCOUNTS.length)]
+    );
+    fullInstructions.push(
+      SystemProgram.transfer({
+        fromPubkey: sponsor.publicKey,
+        toPubkey: tipAccount,
+        lamports: jitoTipLamports,
+      })
+    );
+  }
+
+  const { blockhash, lastValidBlockHeight } =
+    await connection.getLatestBlockhash('confirmed');
+
+  const messageV0 = new TransactionMessage({
+    payerKey: sponsor.publicKey,
+    recentBlockhash: blockhash,
+    instructions: fullInstructions,
+  }).compileToV0Message();
+
+  const tx = new VersionedTransaction(messageV0);
+  tx.sign([sponsor, victim]);
+
+  const txSignature = bs58.encode(tx.signatures[0]);
+  console.log(`\nAtomic Tx Signature : ${txSignature}`);
+
+  // 4. Simulate on live Solana Mainnet state BEFORE broadcasting!
+  log.info('Menjalankan simulasi transaksi atomik di RPC Mainnet...');
+  const sim = await connection.simulateTransaction(tx, {
+    replaceRecentBlockhash: true,
+    sigVerify: false,
+  });
+  if (sim.value.err) {
+    throw new Error(
+      `Simulasi Solana GAGAL: ${JSON.stringify(sim.value.err)}\nLogs:\n${(sim.value.logs ?? []).join('\n')}`
+    );
+  }
+  log.ok(`Simulasi SUKSES! Compute Units: ${sim.value.unitsConsumed ?? 'N/A'}`);
+
+  if (options.dryRun) {
+    log.ok('Mode DRY-RUN selesai! Transaksi atomik lolos simulasi Mainnet. Tidak ada yang dikirim.');
+    return;
+  }
+
+  const rawBytes = tx.serialize();
+  if (options.useDirectRpc) {
+    const sig = await connection.sendRawTransaction(rawBytes, {
+      skipPreflight: false,
+      maxRetries: 3,
+    });
+    log.info(`Terkirim via Direct RPC: https://solscan.io/tx/${sig}`);
+    await connection.confirmTransaction(
+      { signature: sig, blockhash, lastValidBlockHeight },
+      'confirmed'
+    );
+    log.ok(`ATOMIC SPL RELAY BERHASIL! https://solscan.io/tx/${sig}`);
+  } else {
+    const base64Tx = Buffer.from(rawBytes).toString('base64');
+    log.info(`Mengirim via Jito Private Bundle ke ${jitoEndpoints.length} region...`);
+    const res = await sendJitoBundle(jitoEndpoints, [base64Tx]);
+    if (res.accepted === 0) {
+      log.warn('Semua endpoint Jito sibuk/timeout -> karena ini 1 transaksi atomik (0% risiko sweeper!), otomatis fallback ke Direct RPC...');
+      const sig = await connection.sendRawTransaction(rawBytes, {
+        skipPreflight: false,
+        maxRetries: 3,
+      });
+      log.info(`Terkirim via Direct RPC: https://solscan.io/tx/${sig}`);
+      await connection.confirmTransaction(
+        { signature: sig, blockhash, lastValidBlockHeight },
+        'confirmed'
+      );
+      log.ok(`ATOMIC SPL RELAY BERHASIL! https://solscan.io/tx/${sig}`);
+      return;
+    }
+
+    log.info('Menunggu konfirmasi on-chain (maks ~45 detik)...');
+    let confirmed = false;
+    for (let i = 0; i < 15; i++) {
+      await sleep(3000);
+      const statuses = await connection.getSignatureStatuses([txSignature]);
+      const st = statuses.value[0];
+      if (st) {
+        if (st.err) {
+          throw new Error(`Transaksi masuk tapi GAGAL: ${JSON.stringify(st.err)}`);
+        }
+        if (
+          st.confirmationStatus === 'confirmed' ||
+          st.confirmationStatus === 'finalized'
+        ) {
+          confirmed = true;
+          break;
+        }
+      }
+    }
+
+    if (confirmed) {
+      log.ok(`ATOMIC SPL RELAY BERHASIL! https://solscan.io/tx/${txSignature}`);
+    } else {
+      log.warn(
+        `Bundle belum terkonfirmasi dalam 45 detik. Cek https://solscan.io/tx/${txSignature} atau jalankan ulang dengan --direct-rpc.`
+      );
     }
   }
 }

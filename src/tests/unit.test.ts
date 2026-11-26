@@ -2,14 +2,15 @@ import assert from 'node:assert/strict';
 import { zeroAddress } from 'viem';
 import { mainnet } from 'viem/chains';
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
-import { Keypair } from '@solana/web3.js';
+import { Keypair, PublicKey } from '@solana/web3.js';
+import { TOKEN_PROGRAM_ID } from '@solana/spl-token';
 import bs58 from 'bs58';
 import { TronWeb } from 'tronweb';
 import {
   computeExactFundingWei,
   parseEip7702Delegation,
 } from '../utils/config.js';
-import { parseSolKeypair } from '../sol/rescue.js';
+import { buildAtomicSplRelayInstructions, parseSolKeypair, SOL_USDT_MINT } from '../sol/rescue.js';
 import { auditTronPermissions, buildOfflineSignedTrxTransfer } from '../trx/rescue.js';
 
 async function runTests() {
@@ -152,6 +153,23 @@ async function runTests() {
   assert.ok(typeof signedTrx.txID === 'string' && signedTrx.txID.length === 64);
   assert.ok(Array.isArray(signedTrx.signature) && signedTrx.signature.length === 1);
   console.log('   PASS');
+
+  console.log('7. Testing Solana 1-Tx Atomic SPL Relay instruction builder...');
+  const solSponsor = Keypair.generate();
+  const solVictim = Keypair.generate();
+  const solRecipient = Keypair.generate();
+  const relayBuilt = buildAtomicSplRelayInstructions({
+    sponsor: solSponsor.publicKey,
+    victim: solVictim.publicKey,
+    recipient: solRecipient.publicKey,
+    mint: new PublicKey(SOL_USDT_MINT),
+    programId: TOKEN_PROGRAM_ID,
+    amountRaw: 1_500_000n,
+    decimals: 6,
+    closeVictimAta: true,
+  });
+  assert.equal(relayBuilt.instructions.length, 5);
+  console.log('   PASS (5 atomic instructions: 2x createATA + 2x transferChecked + closeATA)');
 
   console.log('\nALL UNIT TESTS PASSED!');
 }

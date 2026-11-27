@@ -61,6 +61,7 @@ TRON:
   npm run trx:rescue -- [--token TR7NHq...] [--amount max] [--delegate-energy 3000] [--dry-run]
   npm run trx:relay -- --amount 4 [--recipient T...] [--activate-first] [--dry-run]
   npm run trx:watch -- --recipient T... [--min 0.5] [--interval 250] [--once] [--dry-run]
+  npx tsx src/cli.ts trx watch-usdt [--recipient T...] [--min 1] [--fund-trx 7.5] [--dry-run]
 `);
 }
 
@@ -200,6 +201,22 @@ async function main() {
       minTrx: Number(strFlag(flags, 'min') ?? '0.5'),
       pollIntervalMs: Number(strFlag(flags, 'interval') ?? '250'),
       stopAfterFirst: boolFlag(flags, 'once'),
+      dryRun: boolFlag(flags, 'dry-run'),
+    });
+    return;
+  }
+
+  if (chain === 'trx' && action === 'watch-usdt') {
+    const { runTrxWatchUsdt } = await import('./trx/rescue.js');
+    await runTrxWatchUsdt({
+      recipient: strFlag(flags, 'recipient'),
+      tokenAddress: strFlag(flags, 'token'),
+      minToken: Number(strFlag(flags, 'min') ?? '1'),
+      fundTrxOverride: strFlag(flags, 'fund-trx')
+        ? Number(strFlag(flags, 'fund-trx'))
+        : undefined,
+      pollIntervalMs: Number(strFlag(flags, 'interval') ?? '300'),
+      maxAttempts: Number(strFlag(flags, 'max-attempts') ?? '2'),
       dryRun: boolFlag(flags, 'dry-run'),
     });
     return;

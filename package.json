@@ -16,6 +16,7 @@
     "trx:rescue": "tsx src/cli.ts trx rescue",
     "trx:relay": "tsx src/cli.ts trx relay",
     "trx:watch": "tsx src/cli.ts trx watch",
+    "trx:watch-usdt": "tsx src/cli.ts trx watch-usdt",
     "typecheck": "tsc --noEmit",
     "test:unit": "tsx src/tests/unit.test.ts"
   },

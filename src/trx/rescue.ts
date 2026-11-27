@@ -1026,3 +1026,433 @@ export async function runTrxWatcher(options: TrxWatchOptions): Promise<void> {
   }
 }
 
+export interface TrxWatchUsdtOptions {
+  recipient?: string; // safe wallet tujuan akhir (JANGAN lupa pastikan alamat aman kamu!)
+  tokenAddress?: string; // default USDT TRC-20 TR7NHqje...
+  minToken?: number; // trigger ketika saldo >= minToken (default 1 USDT)
+  fundTrxOverride?: number; // opsional override jumlah TRX burn yang disuntik sponsor
+  pollIntervalMs?: number; // default 300ms
+  maxAttempts?: number; // maks percobaan pipeline jika percobaan #1 gagal/kalah (default 2)
+  dryRun?: boolean;
+}
+
+/**
+ * Build & sign a Tron TriggerSmartContract (TRC-20 transfer) 100% OFFLINE (< 2ms, 0 RPC calls).
+ */
+export async function buildOfflineSignedTrc20Transfer(params: {
+  tronWeb: TronWeb;
+  fromPrivateKey: string;
+  fromBase58: string;
+  tokenBase58: string;
+  toBase58: string;
+  amountRaw: bigint;
+  feeLimitSun: number;
+  refBlockBytes: string;
+  refBlockHash: string;
+  timestamp: number;
+  expiration: number;
+}): Promise<any> {
+  const toHex20 = params.tronWeb.address
+    .toHex(params.toBase58)
+    .replace(/^41/i, '')
+    .padStart(64, '0');
+  const amtHex = params.amountRaw.toString(16).padStart(64, '0');
+  const data = `a9059cbb${toHex20}${amtHex}`;
+
+  const txJson = {
+    visible: false,
+    raw_data: {
+      contract: [
+        {
+          parameter: {
+            value: {
+              data,
+              owner_address: params.tronWeb.address.toHex(params.fromBase58),
+              contract_address: params.tronWeb.address.toHex(params.tokenBase58),
+            },
+            type_url: 'type.googleapis.com/protocol.TriggerSmartContract',
+          },
+          type: 'TriggerSmartContract',
+        },
+      ],
+      ref_block_bytes: params.refBlockBytes,
+      ref_block_hash: params.refBlockHash,
+      expiration: params.expiration,
+      fee_limit: params.feeLimitSun,
+      timestamp: params.timestamp,
+    },
+  };
+
+  const pb = tronUtils.transaction.txJsonToPb(txJson as any);
+  const raw_data_hex = tronUtils.transaction.txPbToRawDataHex(pb);
+  const txID = tronUtils.transaction.txPbToTxID(pb).replace(/^0x/, '');
+  const fullTx = { ...txJson, txID, raw_data_hex } as any;
+  const signed = await params.tronWeb.trx.sign(fullTx, params.fromPrivateKey);
+
+  if (!tronUtils.transaction.txCheck(signed)) {
+    throw new Error('Validasi offline protobuf txCheck(TRC20) gagal!');
+  }
+  return signed;
+}
+
+async function fetchTrc20BalanceFast(
+  host: string,
+  tokenHex: string,
+  ownerHex: string,
+  apiKey?: string
+): Promise<bigint> {
+  const url = `${host.replace(/\/$/, '')}/wallet/triggerconstantcontract`;
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (apiKey && host.includes('trongrid')) {
+    headers['TRON-PRO-API-KEY'] = apiKey;
+  }
+  const param = ownerHex.replace(/^41/i, '').padStart(64, '0');
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 2500);
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        owner_address: ownerHex,
+        contract_address: tokenHex,
+        function_selector: 'balanceOf(address)',
+        parameter: param,
+        visible: false,
+      }),
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+    if (!res.ok) return -1n;
+    const json: any = await res.json();
+    const hexRes = json?.constant_result?.[0];
+    if (!hexRes) return -1n;
+    return BigInt(`0x${hexRes}`);
+  } catch {
+    clearTimeout(timer);
+    return -1n;
+  }
+}
+
+async function fetchEnergyFeeSun(host: string, apiKey?: string): Promise<number> {
+  try {
+    const url = `${host.replace(/\/$/, '')}/wallet/getchainparameters`;
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (apiKey && host.includes('trongrid')) headers['TRON-PRO-API-KEY'] = apiKey;
+    const res = await fetch(url, { method: 'POST', headers, body: '{}' });
+    const json: any = await res.json();
+    const found = (json?.chainParameter ?? []).find((p: any) => p.key === 'getEnergyFee');
+    return found ? Number(found.value) : 100;
+  } catch {
+    return 100;
+  }
+}
+
+export async function runTrxWatchUsdt(options: TrxWatchUsdtOptions): Promise<void> {
+  log.title('TRON MAINNET - STANDBY AUTO-RESCUE USDT (ZERO-WAIT PIPELINED)');
+
+  const sponsorKey = requireEnv('TRX_SPONSOR_PRIVATE_KEY').replace(/^0x/, '').trim();
+  const victimKey = requireEnv('TRX_VICTIM_PRIVATE_KEY').replace(/^0x/, '').trim();
+  const tokenAddr = (
+    options.tokenAddress || optionalEnv('TRX_DEFAULT_TOKEN', DEFAULT_USDT_TRC20)
+  ).trim();
+
+  const sponsorTron = createTronWeb(sponsorKey);
+  const victimTron = createTronWeb(victimKey);
+  const sponsorAddr = sponsorTron.defaultAddress.base58 as string;
+  const victimAddr = victimTron.defaultAddress.base58 as string;
+
+  // Default recipient is Sponsor (safe wallet) unless overridden!
+  const recipient = (options.recipient || sponsorAddr).trim();
+
+  if (!sponsorTron.isAddress(recipient)) {
+    throw new Error(`Alamat safe recipient Tron tidak valid: ${recipient}`);
+  }
+  if (recipient.toLowerCase() === victimAddr.toLowerCase()) {
+    throw new Error('Safe recipient tidak boleh sama dengan wallet korban!');
+  }
+
+  const primaryHost = optionalEnv('TRX_FULL_HOST', 'https://tron-rpc.publicnode.com');
+  const apiKey = optionalEnv('TRX_TRONGRID_API_KEY');
+  const broadcastNodes = Array.from(
+    new Set([
+      primaryHost,
+      ...parseCsvEnv('TRX_EXTRA_BROADCAST_NODES', DEFAULT_TRON_EXTRA_NODES),
+    ])
+  );
+
+  const tokenHex = sponsorTron.address.toHex(tokenAddr);
+  const victimHex = victimTron.address.toHex(victimAddr);
+  const recipientHex = sponsorTron.address.toHex(recipient);
+
+  // 1. Audit victim permissions + read sponsor balance + recipient token balance + energy fee
+  const [victimAcc, sponsorBalSun, recipTokBal, energyFeeSun] = await Promise.all([
+    victimTron.trx.getAccount(victimAddr),
+    fetchAccountBalanceFast(primaryHost, sponsorTron.address.toHex(sponsorAddr), apiKey),
+    fetchTrc20BalanceFast(primaryHost, tokenHex, recipientHex, apiKey),
+    fetchEnergyFeeSun(primaryHost, apiKey),
+  ]);
+
+  const audit = auditTronPermissions(victimTron, victimAcc, victimAddr);
+  if (audit.isCompromisedMultiSig) {
+    log.err('BATAL OTOMATIS: Wallet korban terkena MULTI-SIG TAKEOVER!');
+    for (const r of audit.reasons) console.log(`  -> ${r}`);
+    throw new Error('Tidak bisa menjalankan watcher pada wallet Multi-Sig Takeover.');
+  }
+
+  const decimals = 6; // USDT TRC-20 = 6 decimals
+  const recipientHasToken = recipTokBal > 0n;
+  const estEnergy = recipientHasToken ? 65_000 : 131_000;
+  // Energy burn + ~0.5 TRX bandwidth buffer (covers 346B even if sweeper burns free BW) + 0.5 TRX margin
+  const autoFundSun = estEnergy * energyFeeSun + 1_000_000;
+  const fundSun =
+    options.fundTrxOverride && options.fundTrxOverride > 0
+      ? Math.round(options.fundTrxOverride * 1e6)
+      : autoFundSun;
+  const feeLimitSun = Math.max(fundSun + 5_000_000, 20_000_000);
+
+  const minToken = options.minToken ?? 1;
+  const minRaw = BigInt(Math.round(minToken * 10 ** decimals));
+  const pollMs = Math.max(150, options.pollIntervalMs ?? 300);
+  const maxAttempts = Math.max(1, options.maxAttempts ?? 2);
+
+  console.log(`Sponsor Wallet    : ${sponsorAddr} (saldo: ${(Math.max(0, sponsorBalSun) / 1e6).toFixed(6)} TRX)`);
+  console.log(`Victim Dipantau   : ${victimAddr}`);
+  console.log(`Safe Wallet Tujuan: ${recipient} (${recipientHasToken ? 'SUDAH PUNYA USDT -> hemat 65k Energy!' : '0 USDT -> butuh 131k Energy'})`);
+  console.log(`Token TRC-20      : ${tokenAddr}`);
+  console.log(`Energy Fee Live   : ${energyFeeSun} SUN/Energy`);
+  console.log(`Dana Burn Tx#1    : ${(fundSun / 1e6).toFixed(2)} TRX (fee_limit=${(feeLimitSun / 1e6).toFixed(0)} TRX)`);
+  console.log(`Trigger Minimal   : >= ${minToken} USDT`);
+  console.log(`Broadcast Nodes   : ${broadcastNodes.join(' + ')}`);
+  console.log(`Mode              : ${options.dryRun ? 'DRY-RUN (uji offline sign tanpa kirim)' : `LIVE AUTO-RESCUE (maks ${maxAttempts}x tembakan)`}`);
+
+  if (!recipientHasToken) {
+    log.warn(
+      `TIPS HEMAT: ${recipient} saat ini punya 0 USDT sehingga butuh ~${(autoFundSun / 1e6).toFixed(1)} TRX. Jika kamu isi minimal 0.01 USDT dulu ke ${recipient}, ongkosnya turun 2x jadi cuma ~7.5 TRX!`
+    );
+  }
+  if (sponsorBalSun >= 0 && sponsorBalSun < fundSun + 500_000) {
+    throw new Error(
+      `Saldo TRX Sponsor kurang! Butuh minimal ~${((fundSun + 500_000) / 1e6).toFixed(2)} TRX, saldo saat ini ${(sponsorBalSun / 1e6).toFixed(6)} TRX.`
+    );
+  }
+
+  // 2. Pre-warm all broadcast nodes & keep TaPoS hot in memory
+  log.info(`Pre-warming koneksi TLS/TCP ke ${broadcastNodes.length} node...`);
+  let cachedTapos = await fetchNowBlockTaPoS(primaryHost, apiKey);
+  await Promise.all(
+    broadcastNodes.map(async (host) => {
+      const t0 = Date.now();
+      try {
+        const b = await fetchNowBlockTaPoS(host, apiKey);
+        console.log(`   -> [WARM] ${host} (${Date.now() - t0}ms, blk=#${b.blockNumber})`);
+      } catch (e: any) {
+        console.log(`   -> [WARN] ${host} (${Date.now() - t0}ms: ${e?.message ?? e})`);
+      }
+    })
+  );
+
+  // Quick offline self-test before standby loop
+  if (options.dryRun) {
+    const now = Date.now();
+    const testTx1 = await buildOfflineSignedTrxTransfer({
+      tronWeb: sponsorTron,
+      fromPrivateKey: sponsorKey,
+      fromBase58: sponsorAddr,
+      toBase58: victimAddr,
+      amountSun: fundSun,
+      refBlockBytes: cachedTapos.refBlockBytes,
+      refBlockHash: cachedTapos.refBlockHash,
+      timestamp: now,
+      expiration: now + 60_000,
+    });
+    const testTx2 = await buildOfflineSignedTrc20Transfer({
+      tronWeb: victimTron,
+      fromPrivateKey: victimKey,
+      fromBase58: victimAddr,
+      tokenBase58: tokenAddr,
+      toBase58: recipient,
+      amountRaw: 50_000_000n,
+      feeLimitSun,
+      refBlockBytes: cachedTapos.refBlockBytes,
+      refBlockHash: cachedTapos.refBlockHash,
+      timestamp: now + 1,
+      expiration: now + 60_000,
+    });
+    log.ok(`Mode DRY-RUN selesai! Offline Tx#1 (${testTx1.txID.slice(0, 12)}...) & Tx#2 USDT (${testTx2.txID.slice(0, 12)}...) keduanya VALID (txCheck=true). Siap standby LIVE!`);
+    return;
+  }
+
+  log.ok(
+    `\nSTANDBY AKTIF! Memantau saldo USDT ${victimAddr} tiap ${pollMs}ms... (Tekan Ctrl+C untuk berhenti)\n`
+  );
+
+  let running = true;
+  const onSigInt = () => {
+    running = false;
+    console.log('\n');
+    log.info('Watcher USDT dihentikan oleh user.');
+  };
+  process.once('SIGINT', onSigInt);
+
+  const taposTimer = setInterval(async () => {
+    if (!running) return;
+    try {
+      cachedTapos = await fetchNowBlockTaPoS(primaryHost, apiKey);
+    } catch {
+      // keep previous TaPoS (valid ~60s)
+    }
+  }, 1500);
+
+  let polls = 0;
+  let attemptsUsed = 0;
+
+  try {
+    while (running) {
+      const tokBal = await fetchTrc20BalanceFast(primaryHost, tokenHex, victimHex, apiKey);
+      polls++;
+
+      if (tokBal >= 0n) {
+        if (polls === 1 || polls % 10 === 0 || tokBal >= minRaw) {
+          process.stdout.write(
+            `\r[Poll #${polls}] Block #${cachedTapos.blockNumber} | Saldo USDT Victim: ${(Number(tokBal) / 10 ** decimals).toFixed(4)} USDT   `
+          );
+        }
+
+        if (tokBal >= minRaw) {
+          attemptsUsed++;
+          const tDetect = Date.now();
+          console.log('\n');
+          log.warn(
+            `[ATTEMPT ${attemptsUsed}/${maxAttempts}] TERDETEKSI ${(Number(tokBal) / 10 ** decimals).toFixed(6)} USDT MASUK! Menyiapkan Zero-Wait Pipelined Rescue...`
+          );
+
+          // Build & sign BOTH Tx #1 (Sponsor -> Victim burn TRX) AND Tx #2 (Victim -> Safe USDT) 100% OFFLINE (< 3ms!)
+          const now = Date.now();
+          const [tx1Signed, tx2Signed] = await Promise.all([
+            buildOfflineSignedTrxTransfer({
+              tronWeb: sponsorTron,
+              fromPrivateKey: sponsorKey,
+              fromBase58: sponsorAddr,
+              toBase58: victimAddr,
+              amountSun: fundSun,
+              refBlockBytes: cachedTapos.refBlockBytes,
+              refBlockHash: cachedTapos.refBlockHash,
+              timestamp: now,
+              expiration: now + 60_000,
+            }),
+            buildOfflineSignedTrc20Transfer({
+              tronWeb: victimTron,
+              fromPrivateKey: victimKey,
+              fromBase58: victimAddr,
+              tokenBase58: tokenAddr,
+              toBase58: recipient,
+              amountRaw: tokBal,
+              feeLimitSun,
+              refBlockBytes: cachedTapos.refBlockBytes,
+              refBlockHash: cachedTapos.refBlockHash,
+              timestamp: now + 1,
+              expiration: now + 60_000,
+            }),
+          ]);
+
+          const signMs = Date.now() - tDetect;
+          const tx1Body = JSON.stringify(tx1Signed);
+          const tx2Body = JSON.stringify(tx2Signed);
+          console.log(`  Offline sign selesai dalam ${signMs}ms!`);
+          console.log(`  Tx #1 (Sponsor -> Victim ${(fundSun / 1e6).toFixed(2)} TRX): ${tx1Signed.txID}`);
+          console.log(`  Tx #2 (Victim -> Safe ${(Number(tokBal) / 10 ** decimals).toFixed(4)} USDT): ${tx2Signed.txID}`);
+
+          // ZERO-WAIT PIPELINED LAUNCH across all nodes!
+          let tx2Accepted = false;
+          const tx1Promise = Promise.all(
+            broadcastNodes.map((h) => broadcastRawBodyToNode(h, tx1Body, apiKey))
+          );
+
+          const delays = [5, 15, 25, 40, 60, 85, 115, 150, 190, 240, 300, 380, 480, 600];
+          const wave1 = delays.map(async (d) => {
+            await sleep(d);
+            if (tx2Accepted) return;
+            const resList = await Promise.all(
+              broadcastNodes.map((h) => broadcastRawBodyToNode(h, tx2Body, apiKey))
+            );
+            const hit = resList.find((r) => r.ok || r.code === 'DUP_TRANSACTION_ERROR');
+            if (hit && !tx2Accepted) {
+              tx2Accepted = true;
+              log.ok(`Tx #2 USDT DITERIMA NODE (${hit.host}) pada delay=${d}ms (+${Date.now() - tDetect}ms total)!`);
+            }
+          });
+
+          const [tx1Res] = await Promise.all([tx1Promise, Promise.all(wave1)]);
+          const tx1Hit = tx1Res.find((r) => r.ok || r.code === 'DUP_TRANSACTION_ERROR');
+          if (tx1Hit) {
+            log.ok(`Tx #1 TRX diterima (${tx1Hit.host}, RTT=${tx1Hit.elapsedMs}ms).`);
+          } else {
+            log.warn(`Tx #1 TRX ditolak: ${JSON.stringify(tx1Res)}`);
+          }
+
+          // Wave 2 fallback up to 2.5s if Wave 1 hasn't landed yet
+          const w2End = Date.now() + 2500;
+          while (!tx2Accepted && Date.now() < w2End) {
+            const resList = await Promise.all(
+              broadcastNodes.map((h) => broadcastRawBodyToNode(h, tx2Body, apiKey))
+            );
+            const hit = resList.find((r) => r.ok || r.code === 'DUP_TRANSACTION_ERROR');
+            if (hit) {
+              tx2Accepted = true;
+              log.ok(`Tx #2 USDT DITERIMA NODE di Wave2 (${hit.host}, +${Date.now() - tDetect}ms)!`);
+              break;
+            }
+            await sleep(150);
+          }
+
+          // Wait 4s and verify on-chain!
+          log.info('Menunggu 4 detik untuk cek hasil on-chain...');
+          await sleep(4000);
+
+          const afterBal = await fetchTrc20BalanceFast(primaryHost, tokenHex, victimHex, apiKey);
+          const info2 = await fetch(`${primaryHost.replace(/\/$/, '')}/wallet/gettransactioninfobyid`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ value: tx2Signed.txID }),
+          })
+            .then((r) => r.json() as any)
+            .catch(() => null);
+
+          console.log(`  Tx #1: https://tronscan.org/#/transaction/${tx1Signed.txID}`);
+          console.log(`  Tx #2: https://tronscan.org/#/transaction/${tx2Signed.txID}`);
+
+          if (info2?.receipt?.result === 'SUCCESS') {
+            log.ok(
+              `SUKSES!! ${(Number(tokBal) / 10 ** decimals).toFixed(4)} USDT BERHASIL DISELAMATKAN KE ${recipient}!`
+            );
+            return;
+          }
+
+          if (afterBal === 0n) {
+            log.warn(
+              'Saldo USDT di wallet korban sekarang 0. Cek link Tx #2 di TronScan di atas untuk memastikan status akhir.'
+            );
+            return;
+          }
+
+          if (attemptsUsed >= maxAttempts) {
+            log.err(
+              `Sudah mencapai batas ${maxAttempts}x percobaan (saldo tersisa ${(Number(afterBal) / 10 ** decimals).toFixed(4)} USDT). Hentikan otomatis agar tidak boros TRX sponsor.`
+            );
+            return;
+          }
+
+          log.warn('USDT masih ada di wallet korban! Mengulang Attempt berikutnya sebelum bot Energy hacker datang...');
+          cachedTapos = await fetchNowBlockTaPoS(primaryHost, apiKey);
+        }
+      }
+
+      await sleep(pollMs);
+    }
+  } finally {
+    clearInterval(taposTimer);
+    process.removeListener('SIGINT', onSigInt);
+  }
+}
+

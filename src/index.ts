@@ -10,7 +10,13 @@ import {
   SOL_USDC_MINT,
   SOL_USDT_MINT,
 } from './sol/rescue.js';
-import { checkTrxWallet, runTrxRelay, runTrxRescue, runTrxWatcher } from './trx/rescue.js';
+import {
+  checkTrxWallet,
+  runTrxRelay,
+  runTrxRescue,
+  runTrxWatcher,
+  runTrxWatchUsdt,
+} from './trx/rescue.js';
 import { COLORS, log } from './utils/config.js';
 
 const rl = createInterface({ input, output });
@@ -270,6 +276,31 @@ async function menuTrxWatch() {
   });
 }
 
+async function menuTrxWatchUsdt() {
+  const recipient = await ask(
+    'Alamat WALLET AMAN PRIBADI tujuan USDT (kosongkan = otomatis ke wallet Sponsor di .env)'
+  );
+  const minToken = Number(await ask('Minimal saldo USDT untuk langsung diselamatkan (mis. 1)', '1'));
+  const dryRun = await askYesNo('Jalankan DRY-RUN (uji offline sign & ping node) dulu?', true);
+
+  await runTrxWatchUsdt({
+    recipient: recipient || undefined,
+    minToken,
+    dryRun,
+  });
+
+  if (dryRun) {
+    const goLive = await askYesNo('\nDRY-RUN OK. Aktifkan STANDBY LIVE sekarang?', false);
+    if (goLive) {
+      await runTrxWatchUsdt({
+        recipient: recipient || undefined,
+        minToken,
+        dryRun: false,
+      });
+    }
+  }
+}
+
 async function main() {
   console.log(`${COLORS.bold}${COLORS.cyan}`);
   console.log('======================================================');
@@ -289,10 +320,11 @@ async function main() {
     console.log('  8. [TRX] Cek Status Wallet & Deteksi Multi-Sig Takeover');
     console.log('  9. [TRX] Jalankan Resource-Delegated TRC-20 Rescue (USDT)');
     console.log(' 10. [TRX] Kirim TRX via Offline Pre-Sign & Rapid-Fire Relay');
-    console.log(' 11. [TRX] Standby Auto-Forward Watcher (Otomatis teruskan TRX masuk ke wallet aman)');
+    console.log(' 11. [TRX] Standby Auto-Forward Watcher (TRX masuk -> wallet aman)');
+    console.log(' 12. [TRX] Standby Auto-Rescue USDT (Zero-Wait Pipelined saat USDT masuk!)');
     console.log('  0. Keluar');
 
-    const pick = await ask('\nPilih menu (0-11)');
+    const pick = await ask('\nPilih menu (0-12)');
     try {
       if (pick === '0') {
         break;
@@ -323,6 +355,8 @@ async function main() {
         await menuTrxRelay();
       } else if (pick === '11') {
         await menuTrxWatch();
+      } else if (pick === '12') {
+        await menuTrxWatchUsdt();
       } else {
         log.warn('Menu tidak dikenali.');
       }

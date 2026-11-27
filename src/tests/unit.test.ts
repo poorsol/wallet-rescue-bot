@@ -17,7 +17,11 @@ import {
   SOL_USDC_MINT,
   SOL_USDT_MINT,
 } from '../sol/rescue.js';
-import { auditTronPermissions, buildOfflineSignedTrxTransfer } from '../trx/rescue.js';
+import {
+  auditTronPermissions,
+  buildOfflineSignedTrc20Transfer,
+  buildOfflineSignedTrxTransfer,
+} from '../trx/rescue.js';
 
 async function runTests() {
   console.log('1. Testing EIP-7702 delegation bytecode detection...');
@@ -186,6 +190,24 @@ async function runTests() {
   });
   assert.equal(lockBuilt.instructions.length, 2);
   console.log('   PASS (2 atomic instructions: createATA + setAuthority AccountOwner)');
+
+  console.log('9. Testing Tron offline pre-signed TRC-20 transfer (TriggerSmartContract + fee_limit)...');
+  const signedTrc20 = await buildOfflineSignedTrc20Transfer({
+    tronWeb: tw,
+    fromPrivateKey: victimTrx.privateKey,
+    fromBase58: victimTrx.address.base58,
+    tokenBase58: 'TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t',
+    toBase58: attackerTrx.address.base58,
+    amountRaw: 50_000_000n,
+    feeLimitSun: 20_000_000,
+    refBlockBytes: 'abcd',
+    refBlockHash: '0123456789abcdef',
+    timestamp: now,
+    expiration: now + 60_000,
+  });
+  assert.ok(typeof signedTrc20.txID === 'string' && signedTrc20.txID.length === 64);
+  assert.equal(signedTrc20.raw_data.fee_limit, 20_000_000);
+  console.log('   PASS');
 
   console.log('\nALL UNIT TESTS PASSED!');
 }

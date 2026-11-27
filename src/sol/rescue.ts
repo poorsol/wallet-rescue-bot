@@ -9,7 +9,8 @@ import {
   TransactionMessage,
   VersionedTransaction,
 } from '@solana/web3.js';
-import {
+import * as splToken from '@solana/spl-token';
+const {
   AuthorityType,
   TOKEN_2022_PROGRAM_ID,
   TOKEN_PROGRAM_ID,
@@ -19,7 +20,7 @@ import {
   createTransferCheckedInstruction,
   getAssociatedTokenAddressSync,
   getMint,
-} from '@solana/spl-token';
+} = splToken;
 import bs58 from 'bs58';
 import {
   log,

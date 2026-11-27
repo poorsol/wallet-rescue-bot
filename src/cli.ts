@@ -1,12 +1,4 @@
-import { checkEthWallet, runEthRescue, type EthRescueMode } from './eth/rescue.js';
-import {
-  checkSolWallet,
-  runSolClaimLocked,
-  runSolLockAta,
-  runSolRelay,
-  runSolRescue,
-} from './sol/rescue.js';
-import { checkTrxWallet, runTrxRelay, runTrxRescue, runTrxWatcher } from './trx/rescue.js';
+import type { EthRescueMode } from './eth/rescue.js';
 import { log } from './utils/config.js';
 
 function parseArgs(argv: string[]): { positional: string[]; flags: Record<string, string | boolean> } {
@@ -82,11 +74,13 @@ async function main() {
   }
 
   if (chain === 'eth' && action === 'check') {
+    const { checkEthWallet } = await import('./eth/rescue.js');
     await checkEthWallet(strFlag(flags, 'address') ?? extraPositional, strFlag(flags, 'token'));
     return;
   }
 
   if (chain === 'eth' && action === 'rescue') {
+    const { runEthRescue } = await import('./eth/rescue.js');
     const mode = (strFlag(flags, 'mode') ?? 'eth') as EthRescueMode;
     await runEthRescue({
       mode,
@@ -111,11 +105,13 @@ async function main() {
   }
 
   if (chain === 'sol' && action === 'check') {
+    const { checkSolWallet } = await import('./sol/rescue.js');
     await checkSolWallet(strFlag(flags, 'address') ?? extraPositional);
     return;
   }
 
   if (chain === 'sol' && action === 'rescue') {
+    const { runSolRescue } = await import('./sol/rescue.js');
     const mode = (strFlag(flags, 'mode') ?? 'spl') as 'spl' | 'sol';
     await runSolRescue({
       mode,
@@ -130,6 +126,7 @@ async function main() {
   }
 
   if (chain === 'sol' && action === 'relay') {
+    const { runSolRelay } = await import('./sol/rescue.js');
     await runSolRelay({
       recipient: strFlag(flags, 'recipient'),
       mintAddress: strFlag(flags, 'mint'),
@@ -142,6 +139,7 @@ async function main() {
   }
 
   if (chain === 'sol' && action === 'lock-ata') {
+    const { runSolLockAta } = await import('./sol/rescue.js');
     await runSolLockAta({
       mintAddress: strFlag(flags, 'mint'),
       newOwner: strFlag(flags, 'new-owner'),
@@ -151,6 +149,7 @@ async function main() {
   }
 
   if (chain === 'sol' && action === 'claim-locked') {
+    const { runSolClaimLocked } = await import('./sol/rescue.js');
     await runSolClaimLocked({
       victimAddress: strFlag(flags, 'victim'),
       mintAddress: strFlag(flags, 'mint'),
@@ -162,11 +161,13 @@ async function main() {
   }
 
   if (chain === 'trx' && action === 'check') {
+    const { checkTrxWallet } = await import('./trx/rescue.js');
     await checkTrxWallet(strFlag(flags, 'address') ?? extraPositional, strFlag(flags, 'token'));
     return;
   }
 
   if (chain === 'trx' && action === 'rescue') {
+    const { runTrxRescue } = await import('./trx/rescue.js');
     await runTrxRescue({
       tokenAddress: strFlag(flags, 'token'),
       recipient: strFlag(flags, 'recipient'),
@@ -180,6 +181,7 @@ async function main() {
   }
 
   if (chain === 'trx' && action === 'relay') {
+    const { runTrxRelay } = await import('./trx/rescue.js');
     await runTrxRelay({
       recipient: strFlag(flags, 'recipient'),
       amountTrx: Number(strFlag(flags, 'amount') ?? '4'),
@@ -192,6 +194,7 @@ async function main() {
   }
 
   if (chain === 'trx' && action === 'watch') {
+    const { runTrxWatcher } = await import('./trx/rescue.js');
     await runTrxWatcher({
       recipient: strFlag(flags, 'recipient'),
       minTrx: Number(strFlag(flags, 'min') ?? '0.5'),

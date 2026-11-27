@@ -10,7 +10,13 @@ import {
   computeExactFundingWei,
   parseEip7702Delegation,
 } from '../utils/config.js';
-import { buildAtomicSplRelayInstructions, parseSolKeypair, SOL_USDT_MINT } from '../sol/rescue.js';
+import {
+  buildAtomicLockAtaInstructions,
+  buildAtomicSplRelayInstructions,
+  parseSolKeypair,
+  SOL_USDC_MINT,
+  SOL_USDT_MINT,
+} from '../sol/rescue.js';
 import { auditTronPermissions, buildOfflineSignedTrxTransfer } from '../trx/rescue.js';
 
 async function runTests() {
@@ -170,6 +176,16 @@ async function runTests() {
   });
   assert.equal(relayBuilt.instructions.length, 5);
   console.log('   PASS (5 atomic instructions: 2x createATA + 2x transferChecked + closeATA)');
+
+  console.log('8. Testing Solana 1-Tx Atomic Lock ATA (SetAuthority -> safe wallet)...');
+  const lockBuilt = buildAtomicLockAtaInstructions({
+    sponsor: solSponsor.publicKey,
+    victim: solVictim.publicKey,
+    newOwner: solSponsor.publicKey,
+    mint: new PublicKey(SOL_USDC_MINT),
+  });
+  assert.equal(lockBuilt.instructions.length, 2);
+  console.log('   PASS (2 atomic instructions: createATA + setAuthority AccountOwner)');
 
   console.log('\nALL UNIT TESTS PASSED!');
 }

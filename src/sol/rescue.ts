@@ -10,10 +10,12 @@ import {
   VersionedTransaction,
 } from '@solana/web3.js';
 import {
+  AuthorityType,
   TOKEN_2022_PROGRAM_ID,
   TOKEN_PROGRAM_ID,
   createAssociatedTokenAccountIdempotentInstruction,
   createCloseAccountInstruction,
+  createSetAuthorityInstruction,
   createTransferCheckedInstruction,
   getAssociatedTokenAddressSync,
   getMint,
@@ -791,4 +793,330 @@ export async function runSolRelay(options: SolRelayOptions): Promise<void> {
       );
     }
   }
+}
+
+export interface SolLockAtaOptions {
+  mintAddress?: string; // default USDC Solana (EPjFWdd5...)
+  newOwner?: string; // default Sponsor publicKey (harus wallet yg kamu pegang private key-nya!)
+  dryRun?: boolean;
+}
+
+export interface SolClaimLockedOptions {
+  victimAddress?: string; // opsional jika SOL_VICTIM_PRIVATE_KEY ada di .env
+  mintAddress?: string; // default USDC Solana
+  recipient?: string; // default Sponsor publicKey
+  closeAfterClaim?: boolean; // tutup ATA & tarik balik rent ~0.002039 SOL ke Sponsor
+  dryRun?: boolean;
+}
+
+export function buildAtomicLockAtaInstructions(params: {
+  sponsor: PublicKey;
+  victim: PublicKey;
+  newOwner: PublicKey;
+  mint: PublicKey;
+}): {
+  victimAta: PublicKey;
+  instructions: TransactionInstruction[];
+} {
+  const victimAta = getAssociatedTokenAddressSync(
+    params.mint,
+    params.victim,
+    true,
+    TOKEN_PROGRAM_ID
+  );
+
+  const instructions: TransactionInstruction[] = [
+    // 1. Create deterministic ATA for victim (paid by Sponsor ~0.002039 SOL)
+    createAssociatedTokenAccountIdempotentInstruction(
+      params.sponsor,
+      victimAta,
+      params.victim,
+      params.mint,
+      TOKEN_PROGRAM_ID
+    ),
+    // 2. IMMEDIATELY lock AccountOwner authority of victimAta -> newOwner in the EXACT SAME TX!
+    createSetAuthorityInstruction(
+      victimAta,
+      params.victim,
+      AuthorityType.AccountOwner,
+      params.newOwner,
+      [],
+      TOKEN_PROGRAM_ID
+    ),
+  ];
+
+  return { victimAta, instructions };
+}
+
+export async function runSolLockAta(options: SolLockAtaOptions): Promise<void> {
+  log.title('SOLANA MAINNET - 1-TX ATOMIC LOCK ATA (SET AUTHORITY -> WALLET AMAN)');
+
+  const connection = getSolConnection();
+  const sponsor = parseSolKeypair(
+    requireEnv('SOL_SPONSOR_PRIVATE_KEY'),
+    'SOL_SPONSOR_PRIVATE_KEY'
+  );
+  const victim = parseSolKeypair(
+    requireEnv('SOL_VICTIM_PRIVATE_KEY'),
+    'SOL_VICTIM_PRIVATE_KEY'
+  );
+  const newOwner = options.newOwner
+    ? new PublicKey(options.newOwner.trim())
+    : sponsor.publicKey;
+  const mintPubkey = new PublicKey((options.mintAddress || SOL_USDC_MINT).trim());
+
+  // 1. Verify mint is classic SPL Token (Token-2022 ATAs have ImmutableOwner and cannot be reassigned)
+  const mintAccInfo = await connection.getAccountInfo(mintPubkey);
+  if (!mintAccInfo) {
+    throw new Error(`Mint token tidak ditemukan: ${mintPubkey.toBase58()}`);
+  }
+  if (!mintAccInfo.owner.equals(TOKEN_PROGRAM_ID)) {
+    throw new Error(
+      `Mint ${mintPubkey.toBase58()} bukan classic SPL Token (Tokenkeg...). ATA Token-2022 memiliki ImmutableOwner sehingga tidak bisa di-SetAuthority.`
+    );
+  }
+
+  const victimAta = getAssociatedTokenAddressSync(
+    mintPubkey,
+    victim.publicKey,
+    true,
+    TOKEN_PROGRAM_ID
+  );
+
+  const [sponsorBal, ataInfo] = await Promise.all([
+    connection.getBalance(sponsor.publicKey),
+    connection.getParsedAccountInfo(victimAta),
+  ]);
+
+  console.log(`Sponsor (FeePayer): ${sponsor.publicKey.toBase58()} (${(sponsorBal / LAMPORTS_PER_SOL).toFixed(6)} SOL)`);
+  console.log(`Victim Wallet     : ${victim.publicKey.toBase58()}`);
+  console.log(`Mint Token        : ${mintPubkey.toBase58()} (classic SPL)`);
+  console.log(`Victim ATA Target : ${victimAta.toBase58()}`);
+  console.log(`New Locked Owner  : ${newOwner.toBase58()}`);
+
+  if (ataInfo.value) {
+    const parsedOwner = (ataInfo.value.data as any)?.parsed?.info?.owner;
+    if (parsedOwner === newOwner.toBase58()) {
+      log.ok(`ATA ${victimAta.toBase58()} SUDAH TERKUNCI ke ${newOwner.toBase58()}! Tidak perlu transaksi lagi.`);
+      return;
+    }
+    if (parsedOwner && parsedOwner !== victim.publicKey.toBase58()) {
+      throw new Error(
+        `ATA ${victimAta.toBase58()} sudah dimiliki oleh alamat lain (${parsedOwner}) — tidak bisa diubah lagi oleh private key victim.`
+      );
+    }
+    log.info(`ATA sudah ada dengan owner=${parsedOwner}. Akan langsung dikunci ke ${newOwner.toBase58()}.`);
+  } else {
+    log.info('ATA belum ada. Akan dibuat (~0.002039 SOL rent dari Sponsor) & langsung dikunci di 1 tx atomik.');
+    if (sponsorBal < 3_000_000) {
+      throw new Error(
+        `Saldo SOL Sponsor kurang (${(sponsorBal / LAMPORTS_PER_SOL).toFixed(6)} SOL). Butuh minimal ~0.003 SOL.`
+      );
+    }
+  }
+
+  const { instructions } = buildAtomicLockAtaInstructions({
+    sponsor: sponsor.publicKey,
+    victim: victim.publicKey,
+    newOwner,
+    mint: mintPubkey,
+  });
+
+  const fullInstructions: TransactionInstruction[] = [
+    ComputeBudgetProgram.setComputeUnitLimit({ units: 120_000 }),
+    ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 25_000 }),
+    ...instructions,
+  ];
+
+  const { blockhash, lastValidBlockHeight } =
+    await connection.getLatestBlockhash('confirmed');
+
+  const messageV0 = new TransactionMessage({
+    payerKey: sponsor.publicKey,
+    recentBlockhash: blockhash,
+    instructions: fullInstructions,
+  }).compileToV0Message();
+
+  const tx = new VersionedTransaction(messageV0);
+  tx.sign([sponsor, victim]);
+  const txSignature = bs58.encode(tx.signatures[0]);
+  console.log(`\nAtomic Lock Tx Sig : ${txSignature}`);
+
+  log.info('Menjalankan simulasi Lock ATA di RPC Mainnet...');
+  const sim = await connection.simulateTransaction(tx, {
+    replaceRecentBlockhash: true,
+    sigVerify: false,
+  });
+  if (sim.value.err) {
+    throw new Error(
+      `Simulasi Lock ATA GAGAL: ${JSON.stringify(sim.value.err)}\nLogs:\n${(sim.value.logs ?? []).join('\n')}`
+    );
+  }
+  log.ok(`Simulasi SUKSES! Compute Units: ${sim.value.unitsConsumed ?? 'N/A'}`);
+
+  if (options.dryRun) {
+    log.ok('Mode DRY-RUN selesai! Lock ATA lolos simulasi Mainnet. Tidak ada yang dikirim.');
+    return;
+  }
+
+  const sig = await connection.sendRawTransaction(tx.serialize(), {
+    skipPreflight: false,
+    maxRetries: 3,
+  });
+  log.info(`Terkirim via Direct RPC: https://solscan.io/tx/${sig}`);
+  await connection.confirmTransaction(
+    { signature: sig, blockhash, lastValidBlockHeight },
+    'confirmed'
+  );
+  log.ok(`BERHASIL! ATA ${victimAta.toBase58()} sekarang TERKUNCI ke ${newOwner.toBase58()}!`);
+  console.log('  -> Hacker dengan private key korban TIDAK BISA menyedot token dari ATA ini lagi.');
+  console.log('  -> Untuk menarik token yang masuk nanti, jalankan: npx tsx src/cli.ts sol claim-locked');
+}
+
+export async function runSolClaimLocked(options: SolClaimLockedOptions): Promise<void> {
+  log.title('SOLANA MAINNET - TARIK TOKEN DARI ATA TERKUNCI (SOL:CLAIM-LOCKED)');
+
+  const connection = getSolConnection();
+  const sponsor = parseSolKeypair(
+    requireEnv('SOL_SPONSOR_PRIVATE_KEY'),
+    'SOL_SPONSOR_PRIVATE_KEY'
+  );
+
+  let victimPubkey: PublicKey;
+  if (options.victimAddress) {
+    victimPubkey = new PublicKey(options.victimAddress.trim());
+  } else {
+    victimPubkey = parseSolKeypair(
+      requireEnv('SOL_VICTIM_PRIVATE_KEY', 'isi --victim <Pubkey> atau SOL_VICTIM_PRIVATE_KEY'),
+      'SOL_VICTIM_PRIVATE_KEY'
+    ).publicKey;
+  }
+
+  const recipient = options.recipient
+    ? new PublicKey(options.recipient.trim())
+    : sponsor.publicKey;
+  const mintPubkey = new PublicKey((options.mintAddress || SOL_USDC_MINT).trim());
+
+  const victimAta = getAssociatedTokenAddressSync(
+    mintPubkey,
+    victimPubkey,
+    true,
+    TOKEN_PROGRAM_ID
+  );
+  const recipientAta = getAssociatedTokenAddressSync(
+    mintPubkey,
+    recipient,
+    true,
+    TOKEN_PROGRAM_ID
+  );
+
+  const ataInfo = await connection.getParsedAccountInfo(victimAta);
+  if (!ataInfo.value) {
+    throw new Error(`ATA ${victimAta.toBase58()} tidak ditemukan (belum dibuat / sudah ditutup).`);
+  }
+
+  const info = (ataInfo.value.data as any)?.parsed?.info;
+  const currentOwner: string = info?.owner;
+  const rawBal = BigInt(info?.tokenAmount?.amount ?? '0');
+  const decimals = Number(info?.tokenAmount?.decimals ?? 6);
+  const uiAmount = info?.tokenAmount?.uiAmountString ?? '0';
+
+  console.log(`Locked ATA        : ${victimAta.toBase58()} (milik alamat korban ${victimPubkey.toBase58()})`);
+  console.log(`Owner Saat Ini    : ${currentOwner}`);
+  console.log(`Sponsor Signer    : ${sponsor.publicKey.toBase58()}`);
+  console.log(`Saldo Token       : ${uiAmount} (raw=${rawBal})`);
+  console.log(`Tujuan Tarik      : ${recipient.toBase58()}`);
+  console.log(`Close ATA Setelah : ${options.closeAfterClaim ? 'YA (rent ~0.002039 SOL balik ke Sponsor)' : 'Tidak (tetap terkunci untuk kiriman berikutnya)'}`);
+
+  if (currentOwner !== sponsor.publicKey.toBase58()) {
+    throw new Error(
+      `Owner ATA saat ini (${currentOwner}) BUKAN Sponsor (${sponsor.publicKey.toBase58()}). Jalankan sol:lock-ata dulu atau gunakan private key owner yang sesuai.`
+    );
+  }
+
+  if (rawBal === 0n && !options.closeAfterClaim) {
+    log.info('Saldo token di ATA terkunci masih 0. Tambahkan --close jika ingin menutup ATA & menarik kembali rent ~0.002039 SOL.');
+    return;
+  }
+
+  const ixs: TransactionInstruction[] = [
+    ComputeBudgetProgram.setComputeUnitLimit({ units: 150_000 }),
+    ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 25_000 }),
+  ];
+
+  if (rawBal > 0n) {
+    ixs.push(
+      createAssociatedTokenAccountIdempotentInstruction(
+        sponsor.publicKey,
+        recipientAta,
+        recipient,
+        mintPubkey,
+        TOKEN_PROGRAM_ID
+      ),
+      createTransferCheckedInstruction(
+        victimAta,
+        mintPubkey,
+        recipientAta,
+        sponsor.publicKey, // Sponsor is the locked owner - victim key NOT needed!
+        rawBal,
+        decimals,
+        [],
+        TOKEN_PROGRAM_ID
+      )
+    );
+  }
+
+  if (options.closeAfterClaim) {
+    ixs.push(
+      createCloseAccountInstruction(
+        victimAta,
+        sponsor.publicKey,
+        sponsor.publicKey,
+        [],
+        TOKEN_PROGRAM_ID
+      )
+    );
+  }
+
+  const { blockhash, lastValidBlockHeight } =
+    await connection.getLatestBlockhash('confirmed');
+
+  const messageV0 = new TransactionMessage({
+    payerKey: sponsor.publicKey,
+    recentBlockhash: blockhash,
+    instructions: ixs,
+  }).compileToV0Message();
+
+  const tx = new VersionedTransaction(messageV0);
+  tx.sign([sponsor]); // ONLY sponsor signs!
+  const txSignature = bs58.encode(tx.signatures[0]);
+  console.log(`\nClaim Tx Signature : ${txSignature}`);
+
+  log.info('Menjalankan simulasi Claim di RPC Mainnet...');
+  const sim = await connection.simulateTransaction(tx, {
+    replaceRecentBlockhash: true,
+    sigVerify: false,
+  });
+  if (sim.value.err) {
+    throw new Error(
+      `Simulasi Claim GAGAL: ${JSON.stringify(sim.value.err)}\nLogs:\n${(sim.value.logs ?? []).join('\n')}`
+    );
+  }
+  log.ok(`Simulasi SUKSES! Compute Units: ${sim.value.unitsConsumed ?? 'N/A'}`);
+
+  if (options.dryRun) {
+    log.ok('Mode DRY-RUN selesai! Tidak ada yang dikirim.');
+    return;
+  }
+
+  const sig = await connection.sendRawTransaction(tx.serialize(), {
+    skipPreflight: false,
+    maxRetries: 3,
+  });
+  log.info(`Terkirim via Direct RPC: https://solscan.io/tx/${sig}`);
+  await connection.confirmTransaction(
+    { signature: sig, blockhash, lastValidBlockHeight },
+    'confirmed'
+  );
+  log.ok(`BERHASIL! ${rawBal > 0n ? `${uiAmount} token ditarik ke ${recipient.toBase58()}` : 'ATA ditutup & rent dikembalikan ke Sponsor'} -> https://solscan.io/tx/${sig}`);
 }

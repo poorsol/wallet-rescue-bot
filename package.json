@@ -10,6 +10,8 @@
     "sol:check": "tsx src/cli.ts sol check",
     "sol:rescue": "tsx src/cli.ts sol rescue",
     "sol:relay": "tsx src/cli.ts sol relay",
+    "sol:lock-ata": "tsx src/cli.ts sol lock-ata",
+    "sol:claim-locked": "tsx src/cli.ts sol claim-locked",
     "trx:check": "tsx src/cli.ts trx check",
     "trx:rescue": "tsx src/cli.ts trx rescue",
     "trx:relay": "tsx src/cli.ts trx relay",

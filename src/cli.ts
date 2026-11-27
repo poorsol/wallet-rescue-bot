@@ -1,5 +1,11 @@
 import { checkEthWallet, runEthRescue, type EthRescueMode } from './eth/rescue.js';
-import { checkSolWallet, runSolRelay, runSolRescue } from './sol/rescue.js';
+import {
+  checkSolWallet,
+  runSolClaimLocked,
+  runSolLockAta,
+  runSolRelay,
+  runSolRescue,
+} from './sol/rescue.js';
 import { checkTrxWallet, runTrxRelay, runTrxRescue, runTrxWatcher } from './trx/rescue.js';
 import { log } from './utils/config.js';
 
@@ -55,6 +61,8 @@ SOLANA:
   npm run sol:rescue -- --mode spl [--mint all|<Mint>] [--close] [--direct-rpc] [--dry-run]
   npm run sol:rescue -- --mode sol [--amount max|0.01] [--direct-rpc] [--dry-run]
   npm run sol:relay -- --amount 1.5 --recipient <Base58> [--mint Es9vMFrz...] [--direct-rpc] [--dry-run]
+  npx tsx src/cli.ts sol lock-ata [--mint EPjFWdd5...] [--new-owner <Base58>] [--dry-run]
+  npx tsx src/cli.ts sol claim-locked [--mint EPjFWdd5...] [--recipient <Base58>] [--close] [--dry-run]
 
 TRON:
   npm run trx:check T... [--token TR7NHq...]
@@ -128,6 +136,26 @@ async function main() {
       amount: strFlag(flags, 'amount') ?? '1',
       closeVictimAta: !boolFlag(flags, 'no-close'),
       useDirectRpc: boolFlag(flags, 'direct-rpc'),
+      dryRun: boolFlag(flags, 'dry-run'),
+    });
+    return;
+  }
+
+  if (chain === 'sol' && action === 'lock-ata') {
+    await runSolLockAta({
+      mintAddress: strFlag(flags, 'mint'),
+      newOwner: strFlag(flags, 'new-owner'),
+      dryRun: boolFlag(flags, 'dry-run'),
+    });
+    return;
+  }
+
+  if (chain === 'sol' && action === 'claim-locked') {
+    await runSolClaimLocked({
+      victimAddress: strFlag(flags, 'victim'),
+      mintAddress: strFlag(flags, 'mint'),
+      recipient: strFlag(flags, 'recipient'),
+      closeAfterClaim: boolFlag(flags, 'close'),
       dryRun: boolFlag(flags, 'dry-run'),
     });
     return;
